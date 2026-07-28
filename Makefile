@@ -61,8 +61,8 @@ OPERATOR_SDK_VERSION ?= v1.42.2
 # Default to KubeVirt registry; override with IMG= for local development
 IMAGE_REGISTRY ?= quay.io
 REGISTRY_NAMESPACE ?= kubevirt
-IMAGE_TAG ?= latest
-IMG ?= $(IMAGE_REGISTRY)/$(REGISTRY_NAMESPACE)/vm-file-restore-operator:$(IMAGE_TAG)
+TAG ?= latest
+IMG ?= $(IMAGE_REGISTRY)/$(REGISTRY_NAMESPACE)/vm-file-restore-operator:$(TAG)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
