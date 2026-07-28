@@ -8,15 +8,15 @@ The VM File Restore Operator provides a declarative way to restore individual fi
 
 - **PersistentVolumeClaims (PVCs)**: Restore from backup PVCs
 - **VolumeSnapshots**: Restore from Kubernetes VolumeSnapshots
-- **Remote Backups**: Restore from remote storage (S3, NFS, etc.)
+- **Remote Storage**: Restore from remote storage via rclone (S3, GCS, etc.)
 
 This operator simplifies disaster recovery and file-level backup scenarios for virtualized workloads running on KubeVirt, enabling granular restore operations without needing to restore entire VM disk images.
 
 ## Features
 
 - **Declarative File Restore**: Use Kubernetes CRs to restore files to running VMs
-- **Multiple Source Types**: Restore from PVCs, VolumeSnapshots, or remote storage
-- **Automatic and Manual Modes**: Automatic restore with specified paths, or manual mode for interactive restore
+- **Multiple Source Types**: Restore from PVCs, VolumeSnapshots, or remote storage via rclone
+- **Automatic and Manual Modes**: Automatic restore with `sourcePath`, or manual mode (omit `sourcePath`) for interactive restore
 - **Hot-plug Technology**: No VM restart required - volumes are hot-plugged at runtime
 - **Guest OS Auto-Detection**: Automatically detects Linux/Windows and adjusts mount paths
 - **SSH-Based Execution**: Secure SSH access for executing restore commands in guest OS
@@ -26,7 +26,7 @@ This operator simplifies disaster recovery and file-level backup scenarios for v
 
 ## Architecture
 
-The operator uses a 9-phase state machine:
+The operator uses a 10-phase state machine:
 
 ```
 New → Init → Hotplugging → WaitingForAttachment → SSHConnecting → 
@@ -158,11 +158,11 @@ kubectl describe vmfr <restore-name>
 
 The `VirtualMachineFileRestore` CRD allows you to specify:
 
-- **virtualMachineName**: Target VM to restore files into
-- **source**: One of PVC, VolumeSnapshot, or RemoteBackup
-- **files**: List of specific file paths to restore
-- **directories**: List of directories to restore recursively
-- **targetVolume**: (Optional) Specific volume in the VM to restore to
+- **target**: Reference to the target VirtualMachine (apiGroup, kind, name)
+- **source**: One of `pvc`, `snapshot`, or `remote`
+- **sourcePath**: File or directory path to restore from the backup (omit for manual mode)
+- **targetPath**: (Optional) Where to restore files in the target VM filesystem
+- **sourcePartition**: (Optional) Partition number on the backup volume to restore from
 
 ### Examples
 
@@ -174,15 +174,14 @@ kind: VirtualMachineFileRestore
 metadata:
   name: restore-from-pvc
 spec:
-  virtualMachineName: my-vm
+  target:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm
   source:
-    persistentVolumeClaim:
+    pvc:
       name: backup-pvc
-      namespace: default
-  files:
-    - /etc/important-config.conf
-  directories:
-    - /var/lib/data
+  sourcePath: /home/user/data
 ```
 
 #### Restore from VolumeSnapshot
@@ -193,16 +192,17 @@ kind: VirtualMachineFileRestore
 metadata:
   name: restore-from-snapshot
 spec:
-  virtualMachineName: my-vm
+  target:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm
   source:
-    volumeSnapshot:
+    snapshot:
       name: vm-snapshot-20260415
-  files:
-    - /etc/database/db.conf
-  targetVolume: data-volume
+  sourcePath: /etc/database/db.conf
 ```
 
-#### Restore from Remote Backup
+#### Restore from Remote Storage (via rclone)
 
 ```yaml
 apiVersion: filerestore.kubevirt.io/v1alpha1
@@ -210,17 +210,18 @@ kind: VirtualMachineFileRestore
 metadata:
   name: restore-from-remote
 spec:
-  virtualMachineName: my-vm
+  target:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm
   source:
-    remoteBackup:
-      url: s3://my-bucket/backups/vm-backup.tar.gz
-      secretRef:
-        name: s3-credentials
-  directories:
-    - /opt/application/data
+    remote:
+      name: s3_backup
+      bucket: my-bucket
+  sourcePath: /home/user/data
 ```
 
-**Note:** Remote sources are planned but not yet implemented.
+**Note:** Remote sources require rclone to be configured in the guest VM with the named remote.
 
 #### Manual Restore Mode
 
@@ -239,7 +240,6 @@ spec:
   source:
     snapshot:
       name: snap1
-  # No sourcePath - manual mode
 ```
 
 In manual mode:
@@ -459,5 +459,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
-# vm-file-restore-operator
