@@ -63,6 +63,19 @@ func NewClusterServiceVersion(data *ClusterServiceVersionData) (*csvv1alpha1.Clu
 				"capabilities": "Basic Install",
 				"categories":   "Storage",
 				"description":  "VM File Restore Operator provides file-level restore capabilities for KubeVirt VMs",
+				"alm-examples": `[
+          {
+            "apiVersion": "filerestore.kubevirt.io/v1alpha1",
+            "kind": "FileRestoreOperator",
+            "metadata": {
+              "name": "vm-file-restore-operator",
+              "namespace": "file-restore"
+            },
+            "spec": {
+              "imagePullPolicy": "IfNotPresent"
+            }
+          }
+        ]`,
 			},
 		},
 		Spec: csvv1alpha1.ClusterServiceVersionSpec{
