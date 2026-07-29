@@ -22,6 +22,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -143,6 +144,12 @@ func NewClusterServiceVersion(data *ClusterServiceVersionData) (*csvv1alpha1.Clu
 									},
 									Spec: corev1.PodSpec{
 										ServiceAccountName: "vm-file-restore-operator-controller-manager",
+										SecurityContext: &corev1.PodSecurityContext{
+											RunAsNonRoot: boolPtr(true),
+											SeccompProfile: &corev1.SeccompProfile{
+												Type: corev1.SeccompProfileTypeRuntimeDefault,
+											},
+										},
 										Containers: []corev1.Container{
 											{
 												Name:            "manager",
@@ -163,6 +170,19 @@ func NewClusterServiceVersion(data *ClusterServiceVersionData) (*csvv1alpha1.Clu
 														Value: data.Verbosity,
 													},
 												},
+												Resources: corev1.ResourceRequirements{
+													Requests: corev1.ResourceList{
+														corev1.ResourceCPU:    resource.MustParse("10m"),
+														corev1.ResourceMemory: resource.MustParse("96Mi"),
+													},
+												},
+												SecurityContext: &corev1.SecurityContext{
+													AllowPrivilegeEscalation: boolPtr(false),
+													Capabilities: &corev1.Capabilities{
+														Drop: []corev1.Capability{"ALL"},
+													},
+												},
+												TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 												LivenessProbe: &corev1.Probe{
 													ProbeHandler: corev1.ProbeHandler{
 														HTTPGet: &corev1.HTTPGetAction{
@@ -317,6 +337,10 @@ func NewClusterServiceVersion(data *ClusterServiceVersionData) (*csvv1alpha1.Clu
 	}
 
 	return csv, nil
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }
 
 func int32Ptr(i int32) *int32 {
