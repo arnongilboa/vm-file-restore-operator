@@ -84,7 +84,7 @@ var _ = Describe("FileRestoreOperator Controller", func() {
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
 
-		It("should populate phase, versions, and HCO conditions", func() {
+		It("should populate phase, version fields, and status conditions", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &FileRestoreOperatorReconciler{
 				Client:          k8sClient,
