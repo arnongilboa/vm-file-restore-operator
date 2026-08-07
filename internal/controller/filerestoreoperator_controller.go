@@ -20,11 +20,10 @@ import (
 	"context"
 	"fmt"
 
-	conditions "github.com/openshift/custom-resource-status/conditions/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	sdkapi "kubevirt.io/controller-lifecycle-operator-sdk/api"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -32,13 +31,7 @@ import (
 	restorev1alpha1 "kubevirt.io/vm-file-restore-operator/api/v1alpha1"
 )
 
-const (
-	reasonDeployed    = "Deployed"
-	msgAvailable      = "FileRestoreOperator is available"
-	msgUpgradeable    = "FileRestoreOperator is upgradeable"
-	msgNotProgressing = "FileRestoreOperator is not progressing"
-	msgNotDegraded    = "FileRestoreOperator is not degraded"
-)
+const reasonDeployed = "Deployed"
 
 // FileRestoreOperatorReconciler reconciles a FileRestoreOperator object
 type FileRestoreOperatorReconciler struct {
@@ -72,39 +65,38 @@ func (r *FileRestoreOperatorReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, nil
 	}
 
-	fileRestoreOperator.Status.Phase = sdkapi.PhaseDeployed
 	fileRestoreOperator.Status.ObservedGeneration = fileRestoreOperator.Generation
 	fileRestoreOperator.Status.OperatorVersion = version
 	fileRestoreOperator.Status.TargetVersion = version
-	// ObservedVersion matches OperatorVersion immediately: this CR has no
-	// operand rollouts to wait on (restore work runs in-guest via SSH).
 	fileRestoreOperator.Status.ObservedVersion = version
 
-	// Use NoHeartbeat to avoid bumping LastHeartbeatTime on every write; write
-	// frequency is already controlled by fileRestoreOperatorStatusNeedsUpdate.
-	conditions.SetStatusConditionNoHeartbeat(&fileRestoreOperator.Status.Conditions, conditions.Condition{
-		Type:    conditions.ConditionAvailable,
-		Status:  corev1.ConditionTrue,
-		Reason:  reasonDeployed,
-		Message: msgAvailable,
+	apimeta.SetStatusCondition(&fileRestoreOperator.Status.Conditions, metav1.Condition{
+		Type:               restorev1alpha1.ConditionAvailable,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonDeployed,
+		Message:            "FileRestoreOperator is available",
+		ObservedGeneration: fileRestoreOperator.Generation,
 	})
-	conditions.SetStatusConditionNoHeartbeat(&fileRestoreOperator.Status.Conditions, conditions.Condition{
-		Type:    conditions.ConditionProgressing,
-		Status:  corev1.ConditionFalse,
-		Reason:  reasonDeployed,
-		Message: msgNotProgressing,
+	apimeta.SetStatusCondition(&fileRestoreOperator.Status.Conditions, metav1.Condition{
+		Type:               restorev1alpha1.ConditionProgressing,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonDeployed,
+		Message:            "FileRestoreOperator is not progressing",
+		ObservedGeneration: fileRestoreOperator.Generation,
 	})
-	conditions.SetStatusConditionNoHeartbeat(&fileRestoreOperator.Status.Conditions, conditions.Condition{
-		Type:    conditions.ConditionDegraded,
-		Status:  corev1.ConditionFalse,
-		Reason:  reasonDeployed,
-		Message: msgNotDegraded,
+	apimeta.SetStatusCondition(&fileRestoreOperator.Status.Conditions, metav1.Condition{
+		Type:               restorev1alpha1.ConditionDegraded,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonDeployed,
+		Message:            "FileRestoreOperator is not degraded",
+		ObservedGeneration: fileRestoreOperator.Generation,
 	})
-	conditions.SetStatusConditionNoHeartbeat(&fileRestoreOperator.Status.Conditions, conditions.Condition{
-		Type:    conditions.ConditionUpgradeable,
-		Status:  corev1.ConditionTrue,
-		Reason:  reasonDeployed,
-		Message: msgUpgradeable,
+	apimeta.SetStatusCondition(&fileRestoreOperator.Status.Conditions, metav1.Condition{
+		Type:               restorev1alpha1.ConditionUpgradeable,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonDeployed,
+		Message:            "FileRestoreOperator is upgradeable",
+		ObservedGeneration: fileRestoreOperator.Generation,
 	})
 
 	if err := r.Status().Update(ctx, fileRestoreOperator); err != nil {
@@ -122,21 +114,24 @@ func (r *FileRestoreOperatorReconciler) operatorVersion() string {
 	return "devel"
 }
 
+func isConditionSet(conditions []metav1.Condition, condType string, status metav1.ConditionStatus, message string, generation int64) bool {
+	c := apimeta.FindStatusCondition(conditions, condType)
+	return c != nil &&
+		c.Status == status &&
+		c.Reason == reasonDeployed &&
+		c.Message == message &&
+		c.ObservedGeneration == generation
+}
+
 func fileRestoreOperatorStatusNeedsUpdate(status *restorev1alpha1.FileRestoreOperatorStatus, generation int64, version string) bool {
-	return status.Phase != sdkapi.PhaseDeployed ||
-		status.ObservedGeneration != generation ||
+	return status.ObservedGeneration != generation ||
 		status.OperatorVersion != version ||
 		status.TargetVersion != version ||
 		status.ObservedVersion != version ||
-		!isStatusConditionDeployed(status.Conditions, conditions.ConditionAvailable, corev1.ConditionTrue, msgAvailable) ||
-		!isStatusConditionDeployed(status.Conditions, conditions.ConditionProgressing, corev1.ConditionFalse, msgNotProgressing) ||
-		!isStatusConditionDeployed(status.Conditions, conditions.ConditionDegraded, corev1.ConditionFalse, msgNotDegraded) ||
-		!isStatusConditionDeployed(status.Conditions, conditions.ConditionUpgradeable, corev1.ConditionTrue, msgUpgradeable)
-}
-
-func isStatusConditionDeployed(conds []conditions.Condition, condType conditions.ConditionType, status corev1.ConditionStatus, message string) bool {
-	c := conditions.FindStatusCondition(conds, condType)
-	return c != nil && c.Status == status && c.Reason == reasonDeployed && c.Message == message
+		!isConditionSet(status.Conditions, restorev1alpha1.ConditionAvailable, metav1.ConditionTrue, "FileRestoreOperator is available", generation) ||
+		!isConditionSet(status.Conditions, restorev1alpha1.ConditionProgressing, metav1.ConditionFalse, "FileRestoreOperator is not progressing", generation) ||
+		!isConditionSet(status.Conditions, restorev1alpha1.ConditionDegraded, metav1.ConditionFalse, "FileRestoreOperator is not degraded", generation) ||
+		!isConditionSet(status.Conditions, restorev1alpha1.ConditionUpgradeable, metav1.ConditionTrue, "FileRestoreOperator is upgradeable", generation)
 }
 
 // SetupWithManager sets up the controller with the Manager.
