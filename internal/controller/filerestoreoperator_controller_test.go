@@ -22,12 +22,11 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	conditions "github.com/openshift/custom-resource-status/conditions/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	sdkapi "kubevirt.io/controller-lifecycle-operator-sdk/api"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	restorev1alpha1 "kubevirt.io/vm-file-restore-operator/api/v1alpha1"
@@ -84,7 +83,7 @@ var _ = Describe("FileRestoreOperator Controller", func() {
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
 
-		It("should populate phase, version fields, and status conditions", func() {
+		It("should populate version fields and status conditions", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &FileRestoreOperatorReconciler{
 				Client:          k8sClient,
@@ -99,35 +98,38 @@ var _ = Describe("FileRestoreOperator Controller", func() {
 
 			Eventually(func(g Gomega) {
 				g.Expect(k8sClient.Get(ctx, typeNamespacedName, filerestoreoperator)).To(Succeed())
-				g.Expect(filerestoreoperator.Status.Phase).To(Equal(sdkapi.PhaseDeployed))
 				g.Expect(filerestoreoperator.Status.ObservedGeneration).To(Equal(filerestoreoperator.Generation))
 				g.Expect(filerestoreoperator.Status.OperatorVersion).To(Equal(testVersion))
 				g.Expect(filerestoreoperator.Status.TargetVersion).To(Equal(testVersion))
 				g.Expect(filerestoreoperator.Status.ObservedVersion).To(Equal(testVersion))
 
-				avail := conditions.FindStatusCondition(filerestoreoperator.Status.Conditions, conditions.ConditionAvailable)
-				g.Expect(avail).NotTo(BeNil())
-				g.Expect(avail.Status).To(Equal(corev1.ConditionTrue))
-				g.Expect(avail.Reason).To(Equal(reasonDeployed))
-				g.Expect(avail.Message).To(Equal(msgAvailable))
+				available := apimeta.FindStatusCondition(filerestoreoperator.Status.Conditions, restorev1alpha1.ConditionAvailable)
+				g.Expect(available).NotTo(BeNil())
+				g.Expect(available.Status).To(Equal(metav1.ConditionTrue))
+				g.Expect(available.Reason).To(Equal("Deployed"))
+				g.Expect(available.Message).To(Equal("FileRestoreOperator is available"))
+				g.Expect(available.ObservedGeneration).To(Equal(filerestoreoperator.Generation))
 
-				prog := conditions.FindStatusCondition(filerestoreoperator.Status.Conditions, conditions.ConditionProgressing)
-				g.Expect(prog).NotTo(BeNil())
-				g.Expect(prog.Status).To(Equal(corev1.ConditionFalse))
-				g.Expect(prog.Reason).To(Equal(reasonDeployed))
-				g.Expect(prog.Message).To(Equal(msgNotProgressing))
+				progressing := apimeta.FindStatusCondition(filerestoreoperator.Status.Conditions, restorev1alpha1.ConditionProgressing)
+				g.Expect(progressing).NotTo(BeNil())
+				g.Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(progressing.Reason).To(Equal("Deployed"))
+				g.Expect(progressing.Message).To(Equal("FileRestoreOperator is not progressing"))
+				g.Expect(progressing.ObservedGeneration).To(Equal(filerestoreoperator.Generation))
 
-				deg := conditions.FindStatusCondition(filerestoreoperator.Status.Conditions, conditions.ConditionDegraded)
-				g.Expect(deg).NotTo(BeNil())
-				g.Expect(deg.Status).To(Equal(corev1.ConditionFalse))
-				g.Expect(deg.Reason).To(Equal(reasonDeployed))
-				g.Expect(deg.Message).To(Equal(msgNotDegraded))
+				degraded := apimeta.FindStatusCondition(filerestoreoperator.Status.Conditions, restorev1alpha1.ConditionDegraded)
+				g.Expect(degraded).NotTo(BeNil())
+				g.Expect(degraded.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(degraded.Reason).To(Equal("Deployed"))
+				g.Expect(degraded.Message).To(Equal("FileRestoreOperator is not degraded"))
+				g.Expect(degraded.ObservedGeneration).To(Equal(filerestoreoperator.Generation))
 
-				upgradeable := conditions.FindStatusCondition(filerestoreoperator.Status.Conditions, conditions.ConditionUpgradeable)
+				upgradeable := apimeta.FindStatusCondition(filerestoreoperator.Status.Conditions, restorev1alpha1.ConditionUpgradeable)
 				g.Expect(upgradeable).NotTo(BeNil())
-				g.Expect(upgradeable.Status).To(Equal(corev1.ConditionTrue))
-				g.Expect(upgradeable.Reason).To(Equal(reasonDeployed))
-				g.Expect(upgradeable.Message).To(Equal(msgUpgradeable))
+				g.Expect(upgradeable.Status).To(Equal(metav1.ConditionTrue))
+				g.Expect(upgradeable.Reason).To(Equal("Deployed"))
+				g.Expect(upgradeable.Message).To(Equal("FileRestoreOperator is upgradeable"))
+				g.Expect(upgradeable.ObservedGeneration).To(Equal(filerestoreoperator.Generation))
 			}, time.Second*10, time.Millisecond*250).Should(Succeed())
 		})
 
@@ -230,22 +232,21 @@ var _ = Describe("FileRestoreOperator Controller", func() {
 			Expect(k8sClient.Get(ctx, nn, &firstReconcile)).To(Succeed())
 			firstGeneration := firstReconcile.Status.ObservedGeneration
 			Expect(firstReconcile.Status.ObservedVersion).To(Equal(testVersion))
-			Expect(conditions.IsStatusConditionTrue(firstReconcile.Status.Conditions, conditions.ConditionAvailable)).To(BeTrue())
+			Expect(apimeta.IsStatusConditionTrue(firstReconcile.Status.Conditions, restorev1alpha1.ConditionAvailable)).To(BeTrue())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 			Expect(err).NotTo(HaveOccurred())
 
 			var secondReconcile restorev1alpha1.FileRestoreOperator
 			Expect(k8sClient.Get(ctx, nn, &secondReconcile)).To(Succeed())
-			Expect(secondReconcile.Status.Phase).To(Equal(sdkapi.PhaseDeployed))
+			Expect(apimeta.IsStatusConditionTrue(secondReconcile.Status.Conditions, restorev1alpha1.ConditionAvailable)).To(BeTrue())
+			Expect(apimeta.IsStatusConditionFalse(secondReconcile.Status.Conditions, restorev1alpha1.ConditionProgressing)).To(BeTrue())
+			Expect(apimeta.IsStatusConditionFalse(secondReconcile.Status.Conditions, restorev1alpha1.ConditionDegraded)).To(BeTrue())
+			Expect(apimeta.IsStatusConditionTrue(secondReconcile.Status.Conditions, restorev1alpha1.ConditionUpgradeable)).To(BeTrue())
 			Expect(secondReconcile.Status.ObservedGeneration).To(Equal(firstGeneration))
 			Expect(secondReconcile.Status.OperatorVersion).To(Equal(testVersion))
 			Expect(secondReconcile.Status.TargetVersion).To(Equal(testVersion))
 			Expect(secondReconcile.Status.ObservedVersion).To(Equal(testVersion))
-			Expect(conditions.IsStatusConditionTrue(secondReconcile.Status.Conditions, conditions.ConditionAvailable)).To(BeTrue())
-			Expect(conditions.IsStatusConditionFalse(secondReconcile.Status.Conditions, conditions.ConditionProgressing)).To(BeTrue())
-			Expect(conditions.IsStatusConditionFalse(secondReconcile.Status.Conditions, conditions.ConditionDegraded)).To(BeTrue())
-			Expect(conditions.IsStatusConditionTrue(secondReconcile.Status.Conditions, conditions.ConditionUpgradeable)).To(BeTrue())
 		})
 	})
 })
