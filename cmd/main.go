@@ -191,7 +191,7 @@ func main() {
 			filepath.Join(metricsCertPath, metricsCertKey),
 		)
 		if err != nil {
-			setupLog.Error(err, "to initialize metrics certificate watcher")
+			setupLog.Error(err, "Failed to initialize metrics certificate watcher")
 			os.Exit(1)
 		}
 

@@ -76,6 +76,8 @@ func (r *FileRestoreOperatorReconciler) Reconcile(ctx context.Context, req ctrl.
 	fileRestoreOperator.Status.ObservedGeneration = fileRestoreOperator.Generation
 	fileRestoreOperator.Status.OperatorVersion = version
 	fileRestoreOperator.Status.TargetVersion = version
+	// ObservedVersion matches OperatorVersion immediately: this CR has no
+	// operand rollouts to wait on (restore work runs in-guest via SSH).
 	fileRestoreOperator.Status.ObservedVersion = version
 
 	// Use NoHeartbeat to avoid bumping LastHeartbeatTime on every write; write
