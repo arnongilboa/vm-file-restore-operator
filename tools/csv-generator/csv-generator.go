@@ -96,7 +96,13 @@ func main() {
 	fmt.Println("---")
 	fmt.Print(string(yamlBytes))
 	if *dumpCRDs {
-		os.Stdout.Write(vmFileRestoresCRD)
-		os.Stdout.Write(fileRestoreOperatorsCRD)
+		if _, err := os.Stdout.Write(vmFileRestoresCRD); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing CRD: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := os.Stdout.Write(fileRestoreOperatorsCRD); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing CRD: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
