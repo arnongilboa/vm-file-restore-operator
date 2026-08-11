@@ -92,13 +92,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// CSV has no leading "---"; controller-gen CRD assets already include one.
 	fmt.Println("---")
 	fmt.Print(string(yamlBytes))
-
 	if *dumpCRDs {
-		fmt.Println("---")
-		fmt.Print(string(vmFileRestoresCRD))
-		fmt.Println("---")
-		fmt.Print(string(fileRestoreOperatorsCRD))
+		os.Stdout.Write(vmFileRestoresCRD)
+		os.Stdout.Write(fileRestoreOperatorsCRD)
 	}
 }
