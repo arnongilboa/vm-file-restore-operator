@@ -579,17 +579,17 @@ umount /mnt/lvmdata
 			}
 			Eventually(verifyFileRestoreOperatorExists).Should(Succeed())
 
-			By("verifying FileRestoreOperator status phase is updated")
-			verifyFileRestoreOperatorPhase := func(g Gomega) {
+			By("verifying FileRestoreOperator Available condition is set")
+			verifyFileRestoreOperatorAvailable := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "filerestoreoperator",
 					fileRestoreOperatorCRName(), "-n", namespace,
-					"-o", "jsonpath={.status.phase}")
+					"-o", `jsonpath={.status.conditions[?(@.type=="Available")].status}`)
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Deployed"),
-					"Expected FileRestoreOperator phase to be 'Deployed', got '%s'", output)
+				g.Expect(output).To(Equal("True"),
+					"Expected FileRestoreOperator Available condition to be 'True', got '%s'", output)
 			}
-			Eventually(verifyFileRestoreOperatorPhase).Should(Succeed())
+			Eventually(verifyFileRestoreOperatorAvailable).Should(Succeed())
 
 			By("verifying FileRestoreOperator ObservedGeneration is set")
 			verifyObservedGeneration := func(g Gomega) {
@@ -615,14 +615,14 @@ umount /mnt/lvmdata
 
 		It("should perform restore with FileRestoreOperator present", func() {
 			By("verifying that the default FileRestoreOperator CR does not interfere with restore operations")
-			// Verify the FileRestoreOperator is still running and in Deployed state
+			// Verify the FileRestoreOperator is still running and Available
 			cmd := exec.Command("kubectl", "get", "filerestoreoperator",
 				fileRestoreOperatorCRName(), "-n", namespace,
-				"-o", "jsonpath={.status.phase}")
+				"-o", `jsonpath={.status.conditions[?(@.type=="Available")].status}`)
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("Deployed"),
-				"FileRestoreOperator should remain in Deployed state")
+			Expect(output).To(Equal("True"),
+				"FileRestoreOperator Available condition should be 'True'")
 		})
 	})
 })
