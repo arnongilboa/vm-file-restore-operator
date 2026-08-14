@@ -242,6 +242,43 @@ func TestSourceValidation_Counts(t *testing.T) {
 			},
 			expectCount: 2,
 		},
+		{
+			name: "PVC and Remote (invalid)",
+			vmfr: &restorev1alpha1.VirtualMachineFileRestore{
+				Spec: restorev1alpha1.VirtualMachineFileRestoreSpec{
+					Source: restorev1alpha1.RestoreSource{
+						PVC:    &restorev1alpha1.PVCSource{Name: "test"},
+						Remote: &restorev1alpha1.RemoteSource{Name: "s3", Bucket: "bucket"},
+					},
+				},
+			},
+			expectCount: 2,
+		},
+		{
+			name: "Snapshot and Remote (invalid)",
+			vmfr: &restorev1alpha1.VirtualMachineFileRestore{
+				Spec: restorev1alpha1.VirtualMachineFileRestoreSpec{
+					Source: restorev1alpha1.RestoreSource{
+						Snapshot: &restorev1alpha1.VolumeSnapshotSource{Name: "test"},
+						Remote:   &restorev1alpha1.RemoteSource{Name: "s3", Bucket: "bucket"},
+					},
+				},
+			},
+			expectCount: 2,
+		},
+		{
+			name: "PVC, Snapshot, and Remote (invalid)",
+			vmfr: &restorev1alpha1.VirtualMachineFileRestore{
+				Spec: restorev1alpha1.VirtualMachineFileRestoreSpec{
+					Source: restorev1alpha1.RestoreSource{
+						PVC:      &restorev1alpha1.PVCSource{Name: "test"},
+						Snapshot: &restorev1alpha1.VolumeSnapshotSource{Name: "test"},
+						Remote:   &restorev1alpha1.RemoteSource{Name: "s3", Bucket: "bucket"},
+					},
+				},
+			},
+			expectCount: 3,
+		},
 	}
 
 	for _, tt := range tests {

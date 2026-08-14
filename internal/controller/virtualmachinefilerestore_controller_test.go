@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -137,6 +138,109 @@ var _ = Describe("VirtualMachineFileRestore Controller", func() {
 		})
 	})
 
+	Context("When source validation fails", func() {
+		DescribeTable("should transition to Failed with a clear errorMessage",
+			func(resourceName string, source restorev1alpha1.RestoreSource, wantErr string) {
+				ctx := context.Background()
+				typeNamespacedName := types.NamespacedName{
+					Name:      resourceName,
+					Namespace: "default",
+				}
+
+				resource := &restorev1alpha1.VirtualMachineFileRestore{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      resourceName,
+						Namespace: "default",
+					},
+					Spec: restorev1alpha1.VirtualMachineFileRestoreSpec{
+						Target: corev1.TypedLocalObjectReference{
+							APIGroup: ptr.To("kubevirt.io"),
+							Kind:     "VirtualMachine",
+							Name:     "test-vm",
+						},
+						Source:     source,
+						SourcePath: "/data/file.txt",
+					},
+				}
+				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+				DeferCleanup(func() {
+					got := &restorev1alpha1.VirtualMachineFileRestore{}
+					if err := k8sClient.Get(ctx, typeNamespacedName, got); err == nil {
+						got.Finalizers = nil
+						_ = k8sClient.Update(ctx, got)
+						_ = k8sClient.Delete(ctx, got)
+					}
+					Eventually(func() bool {
+						err := k8sClient.Get(ctx, typeNamespacedName, &restorev1alpha1.VirtualMachineFileRestore{})
+						return errors.IsNotFound(err)
+					}, "10s", "100ms").Should(BeTrue())
+				})
+
+				reconciler := &VirtualMachineFileRestoreReconciler{
+					Client:    k8sClient,
+					APIReader: k8sClient,
+					Scheme:    k8sClient.Scheme(),
+					Recorder:  record.NewFakeRecorder(16),
+				}
+
+				By("reconciling to add the finalizer")
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("reconciling Init to run source validation")
+				_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying Failed phase and errorMessage")
+				Eventually(func(g Gomega) {
+					got := &restorev1alpha1.VirtualMachineFileRestore{}
+					g.Expect(k8sClient.Get(ctx, typeNamespacedName, got)).To(Succeed())
+					g.Expect(got.Status.Phase).To(Equal(restorev1alpha1.RestorePhaseFailed))
+					g.Expect(got.Status.ErrorMessage).To(Equal(wantErr))
+				}, "10s", "100ms").Should(Succeed())
+			},
+			Entry("empty source",
+				"test-restore-no-source",
+				restorev1alpha1.RestoreSource{},
+				"no source specified",
+			),
+			Entry("pvc and snapshot",
+				"test-restore-pvc-snap",
+				restorev1alpha1.RestoreSource{
+					PVC:      &restorev1alpha1.PVCSource{Name: "test-pvc"},
+					Snapshot: &restorev1alpha1.VolumeSnapshotSource{Name: "test-snap"},
+				},
+				"multiple sources specified",
+			),
+			Entry("pvc and remote",
+				"test-restore-pvc-remote",
+				restorev1alpha1.RestoreSource{
+					PVC:    &restorev1alpha1.PVCSource{Name: "test-pvc"},
+					Remote: &restorev1alpha1.RemoteSource{Name: "s3", Bucket: "bucket"},
+				},
+				"multiple sources specified",
+			),
+			Entry("snapshot and remote",
+				"test-restore-snap-remote",
+				restorev1alpha1.RestoreSource{
+					Snapshot: &restorev1alpha1.VolumeSnapshotSource{Name: "test-snap"},
+					Remote:   &restorev1alpha1.RemoteSource{Name: "s3", Bucket: "bucket"},
+				},
+				"multiple sources specified",
+			),
+			Entry("pvc, snapshot, and remote",
+				"test-restore-all-three",
+				restorev1alpha1.RestoreSource{
+					PVC:      &restorev1alpha1.PVCSource{Name: "test-pvc"},
+					Snapshot: &restorev1alpha1.VolumeSnapshotSource{Name: "test-snap"},
+					Remote:   &restorev1alpha1.RemoteSource{Name: "s3", Bucket: "bucket"},
+				},
+				"multiple sources specified",
+			),
+		)
+	})
+
 	Context("When reconciling a resource with deletion timestamp", func() {
 		const resourceName = "test-restore-2"
 		ctx := context.Background()
@@ -173,8 +277,9 @@ var _ = Describe("VirtualMachineFileRestore Controller", func() {
 
 			By("reconciling to trigger finalizer cleanup")
 			controllerReconciler := &VirtualMachineFileRestoreReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: record.NewFakeRecorder(16),
 			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
