@@ -60,7 +60,6 @@ var _ = Describe("VirtualMachineFileRestore Controller", func() {
 						},
 					},
 					SourcePath: "/data/backup.tar",
-					TargetPath: "/restore",
 				},
 			}
 			Expect(k8sClient.Create(ctx, resource)).To(Succeed())

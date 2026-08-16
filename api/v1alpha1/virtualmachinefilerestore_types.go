@@ -35,15 +35,6 @@ type VirtualMachineFileRestoreSpec struct {
 	// If not specified, manual restore mode is enabled (volume is hotplugged but no automatic restore).
 	// +optional
 	SourcePath string `json:"sourcePath,omitempty"`
-
-	// TargetPath specifies where to restore files in the target VM filesystem.
-	// If not specified, files are restored to their original locations.
-	// +optional
-	TargetPath string `json:"targetPath,omitempty"`
-
-	// SourcePartition specifies the partition number on the backup volume to restore from.
-	// +optional
-	SourcePartition *int32 `json:"sourcePartition,omitempty"`
 }
 
 // RestoreSource defines the source for file restoration.
