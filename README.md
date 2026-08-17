@@ -161,8 +161,6 @@ The `VirtualMachineFileRestore` CRD allows you to specify:
 - **target**: Reference to the target VirtualMachine (apiGroup, kind, name)
 - **source**: One of `pvc`, `snapshot`, or `remote`
 - **sourcePath**: File or directory path to restore from the backup (omit for manual mode)
-- **targetPath**: (Optional) Where to restore files in the target VM filesystem
-- **sourcePartition**: (Optional) Partition number on the backup volume to restore from
 
 ### Examples
 
