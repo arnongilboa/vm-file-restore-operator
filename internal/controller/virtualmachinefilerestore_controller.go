@@ -56,8 +56,8 @@ type VirtualMachineFileRestoreReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 
@@ -170,7 +170,10 @@ func (r *VirtualMachineFileRestoreReconciler) cleanup(ctx context.Context, vmfr 
 		if err == nil {
 			operatorNamespace := r.getOperatorNamespace()
 			secret := &corev1.Secret{}
-			err = r.Get(ctx, client.ObjectKey{
+			// Uncached read: the SSH Secret is always in the operator namespace, and a
+			// cached get would start an all-namespaces Secret informer needing cluster-scope
+			// list/watch on secrets (which the operator SA should not require).
+			err = r.APIReader.Get(ctx, client.ObjectKey{
 				Name:      SSHKeypairSecretName,
 				Namespace: operatorNamespace,
 			}, secret)
