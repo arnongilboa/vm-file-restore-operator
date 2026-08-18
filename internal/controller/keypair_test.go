@@ -3,14 +3,20 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestEnsureSSHKeypair_CreatesKeypair(t *testing.T) {
@@ -189,4 +195,98 @@ func TestEnsureSSHKeypair_CleansUpOrphanedSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConfigMap not created after orphaned Secret cleanup: %v", err)
 	}
+}
+
+const testOperatorNamespace = "test-operator-ns"
+
+func sshSecret(data map[string][]byte) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      SSHKeypairSecretName,
+			Namespace: testOperatorNamespace,
+		},
+		Type: corev1.SecretTypeSSHAuth,
+		Data: data,
+	}
+}
+
+// getSSHPrivateKey must read the keypair Secret through the uncached APIReader,
+// so these tests wire the fake client only into APIReader (never Client) to prove
+// the read never falls back to the cached client.
+func TestGetSSHPrivateKey_Success(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	reader := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sshSecret(map[string][]byte{corev1.SSHAuthPrivateKey: []byte("PRIVATE-KEY")})).
+		Build()
+
+	r := &VirtualMachineFileRestoreReconciler{
+		APIReader:         reader,
+		OperatorNamespace: testOperatorNamespace,
+	}
+
+	key, err := r.getSSHPrivateKey(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []byte("PRIVATE-KEY"), key)
+}
+
+func TestGetSSHPrivateKey_SecretNotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	reader := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	r := &VirtualMachineFileRestoreReconciler{
+		APIReader:         reader,
+		OperatorNamespace: testOperatorNamespace,
+	}
+
+	key, err := r.getSSHPrivateKey(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, key)
+	assert.True(t, apierrors.IsNotFound(err), "expected NotFound, got %v", err)
+}
+
+func TestGetSSHPrivateKey_MissingPrivateKeyData(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	// Secret exists but has no SSHAuthPrivateKey entry.
+	reader := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sshSecret(map[string][]byte{"some-other-key": []byte("x")})).
+		Build()
+
+	r := &VirtualMachineFileRestoreReconciler{
+		APIReader:         reader,
+		OperatorNamespace: testOperatorNamespace,
+	}
+
+	key, err := r.getSSHPrivateKey(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, key)
+	assert.Contains(t, err.Error(), "not found in secret")
+}
+
+func TestGetSSHPrivateKey_APIError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	boom := errors.New("apiserver unavailable")
+	reader := fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(_ context.Context, _ crclient.WithWatch, _ crclient.ObjectKey, _ crclient.Object, _ ...crclient.GetOption) error {
+				return boom
+			},
+		}).Build()
+
+	r := &VirtualMachineFileRestoreReconciler{
+		APIReader:         reader,
+		OperatorNamespace: testOperatorNamespace,
+	}
+
+	key, err := r.getSSHPrivateKey(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, key)
+	assert.ErrorIs(t, err, boom)
 }

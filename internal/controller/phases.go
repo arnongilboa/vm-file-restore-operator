@@ -493,19 +493,10 @@ func handleSSHConnectingPhase(ctx context.Context, r *VirtualMachineFileRestoreR
 
 	logger.Info("Got VM IP address", "ip", ip)
 
-	// Get SSH private key from Secret
-	secret := &corev1.Secret{}
-	secretKey := client.ObjectKey{
-		Name:      SSHKeypairSecretName,
-		Namespace: r.getOperatorNamespace(),
-	}
-	if err := r.Get(ctx, secretKey, secret); err != nil {
-		return failRestore(ctx, r, vmfr, err, "failed to get SSH keypair secret")
-	}
-
-	privateKey, ok := secret.Data[corev1.SSHAuthPrivateKey]
-	if !ok {
-		return failRestore(ctx, r, vmfr, fmt.Errorf("private key not found in secret"), "SSH private key missing from secret")
+	// Get SSH private key from the operator's keypair Secret (uncached, see getSSHPrivateKey).
+	privateKey, err := r.getSSHPrivateKey(ctx)
+	if err != nil {
+		return failRestore(ctx, r, vmfr, err, "failed to get SSH private key")
 	}
 
 	// Connect SSH with retry (issue #7)
@@ -564,19 +555,10 @@ func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreRecon
 		return failRestore(ctx, r, vmfr, err, "failed to get VM IP address")
 	}
 
-	// Get SSH private key
-	secret := &corev1.Secret{}
-	secretKey := client.ObjectKey{
-		Name:      SSHKeypairSecretName,
-		Namespace: r.getOperatorNamespace(),
-	}
-	if err := r.Get(ctx, secretKey, secret); err != nil {
-		return failRestore(ctx, r, vmfr, err, "failed to get SSH keypair secret")
-	}
-
-	privateKey, ok := secret.Data[corev1.SSHAuthPrivateKey]
-	if !ok {
-		return failRestore(ctx, r, vmfr, fmt.Errorf("private key not found in secret"), "SSH private key missing from secret")
+	// Get SSH private key from the operator's keypair Secret (uncached, see getSSHPrivateKey).
+	privateKey, err := r.getSSHPrivateKey(ctx)
+	if err != nil {
+		return failRestore(ctx, r, vmfr, err, "failed to get SSH private key")
 	}
 
 	// Connect SSH
