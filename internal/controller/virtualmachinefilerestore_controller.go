@@ -168,17 +168,8 @@ func (r *VirtualMachineFileRestoreReconciler) cleanup(ctx context.Context, vmfr 
 		osType := DetectGuestOS(vmi)
 		ip, err := GetVMIPAddress(ctx, r.Client, vmi)
 		if err == nil {
-			operatorNamespace := r.getOperatorNamespace()
-			secret := &corev1.Secret{}
-			// Uncached read: the SSH Secret is always in the operator namespace, and a
-			// cached get would start an all-namespaces Secret informer needing cluster-scope
-			// list/watch on secrets (which the operator SA should not require).
-			err = r.APIReader.Get(ctx, client.ObjectKey{
-				Name:      SSHKeypairSecretName,
-				Namespace: operatorNamespace,
-			}, secret)
+			privateKey, err := r.getSSHPrivateKey(ctx)
 			if err == nil {
-				privateKey := secret.Data[corev1.SSHAuthPrivateKey]
 				// Only attempt SSH cleanup if we have a mount path
 				if vmfr.Status.MountPath == "" {
 					logger.Info("Skipping SSH cleanup - no mount path set (restore never reached that phase)")
@@ -228,6 +219,30 @@ func (r *VirtualMachineFileRestoreReconciler) getOperatorNamespace() string {
 	return "file-restore"
 }
 
+// getSSHPrivateKey returns the SSH private key from the operator's keypair Secret.
+//
+// It reads through the uncached APIReader on purpose: the Secret always lives in the
+// operator namespace, so reading it via the cached client would make controller-runtime
+// start a Secret informer. With the default all-namespaces cache that informer requires
+// cluster-scope list/watch on secrets, which the operator SA should not need. An uncached
+// get needs only namespaced get. This is the single place SSH keys are read so the
+// retrieval method, namespace, and error handling stay consistent (see PR #51).
+func (r *VirtualMachineFileRestoreReconciler) getSSHPrivateKey(ctx context.Context) ([]byte, error) {
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{
+		Name:      SSHKeypairSecretName,
+		Namespace: r.getOperatorNamespace(),
+	}
+	if err := r.APIReader.Get(ctx, key, secret); err != nil {
+		return nil, err
+	}
+	privateKey, ok := secret.Data[corev1.SSHAuthPrivateKey]
+	if !ok {
+		return nil, fmt.Errorf("private key %q not found in secret %s/%s", corev1.SSHAuthPrivateKey, key.Namespace, key.Name)
+	}
+	return privateKey, nil
+}
+
 // setCondition adds or updates a condition in the condition list
 func setCondition(conditions *[]metav1.Condition, newCondition metav1.Condition) {
 	if conditions == nil {
@@ -246,6 +261,13 @@ func setCondition(conditions *[]metav1.Condition, newCondition metav1.Condition)
 // SetupWithManager sets up the controller with the Manager.
 func (r *VirtualMachineFileRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorderFor("virtualmachinefilerestore-controller")
+
+	// Ensure the uncached reader is always set. getSSHPrivateKey relies on it and must
+	// never fall back to the cached client, which would start an all-namespaces Secret
+	// informer requiring cluster-scope list/watch on secrets (see PR #51).
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&restorev1alpha1.VirtualMachineFileRestore{}).

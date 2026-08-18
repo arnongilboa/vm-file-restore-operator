@@ -493,22 +493,10 @@ func handleSSHConnectingPhase(ctx context.Context, r *VirtualMachineFileRestoreR
 
 	logger.Info("Got VM IP address", "ip", ip)
 
-	// Get SSH private key from Secret.
-	// Use the uncached APIReader: the Secret always lives in the operator namespace,
-	// and reading it via the cached client would start an all-namespaces Secret informer
-	// (requiring cluster-scope list/watch on secrets). Uncached get needs only namespaced get.
-	secret := &corev1.Secret{}
-	secretKey := client.ObjectKey{
-		Name:      SSHKeypairSecretName,
-		Namespace: r.getOperatorNamespace(),
-	}
-	if err := r.APIReader.Get(ctx, secretKey, secret); err != nil {
-		return failRestore(ctx, r, vmfr, err, "failed to get SSH keypair secret")
-	}
-
-	privateKey, ok := secret.Data[corev1.SSHAuthPrivateKey]
-	if !ok {
-		return failRestore(ctx, r, vmfr, fmt.Errorf("private key not found in secret"), "SSH private key missing from secret")
+	// Get SSH private key from the operator's keypair Secret (uncached, see getSSHPrivateKey).
+	privateKey, err := r.getSSHPrivateKey(ctx)
+	if err != nil {
+		return failRestore(ctx, r, vmfr, err, "failed to get SSH private key")
 	}
 
 	// Connect SSH with retry (issue #7)
@@ -567,20 +555,10 @@ func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreRecon
 		return failRestore(ctx, r, vmfr, err, "failed to get VM IP address")
 	}
 
-	// Get SSH private key via the uncached APIReader (see handleSSHConnectingPhase:
-	// avoids starting an all-namespaces Secret informer that needs cluster-scope list/watch).
-	secret := &corev1.Secret{}
-	secretKey := client.ObjectKey{
-		Name:      SSHKeypairSecretName,
-		Namespace: r.getOperatorNamespace(),
-	}
-	if err := r.APIReader.Get(ctx, secretKey, secret); err != nil {
-		return failRestore(ctx, r, vmfr, err, "failed to get SSH keypair secret")
-	}
-
-	privateKey, ok := secret.Data[corev1.SSHAuthPrivateKey]
-	if !ok {
-		return failRestore(ctx, r, vmfr, fmt.Errorf("private key not found in secret"), "SSH private key missing from secret")
+	// Get SSH private key from the operator's keypair Secret (uncached, see getSSHPrivateKey).
+	privateKey, err := r.getSSHPrivateKey(ctx)
+	if err != nil {
+		return failRestore(ctx, r, vmfr, err, "failed to get SSH private key")
 	}
 
 	// Connect SSH
