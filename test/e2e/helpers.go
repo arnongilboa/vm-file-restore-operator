@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
@@ -44,18 +45,30 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	filerestorev1alpha1 "kubevirt.io/vm-file-restore-operator/api/v1alpha1"
+	"kubevirt.io/vm-file-restore-operator/internal/controller"
 	"kubevirt.io/vm-file-restore-operator/test/utils"
 )
 
 const (
-	vmName       = "fedora-file-restore-test"
-	bootDiskName = "fedora-boot-dv"
-	bootDiskSize = "10Gi"
+	vmName           = "fedora-file-restore-test"
+	bootDiskName     = "fedora-boot-dv"
+	bootDiskSize     = "10Gi"
+	kubevirtAPIGroup = "kubevirt.io"
 )
+
+func kubevirtAPIGroupPtr() *string {
+	s := kubevirtAPIGroup
+	return &s
+}
 
 type ExtraDisk struct {
 	Name string
 	Size string
+}
+
+// setupTestVMOptions controls optional steps in setupTestVM.
+type setupTestVMOptions struct {
+	skipGuestHelper bool
 }
 
 type TestEnv struct {
@@ -68,6 +81,17 @@ type TestEnv struct {
 }
 
 func setupTestVM(nsPrefix string, extraDisks ...ExtraDisk) *TestEnv {
+	return setupTestVMWithOptions(nsPrefix, setupTestVMOptions{}, extraDisks...)
+}
+
+// setupTestVMWithoutGuestHelper creates a running VM with root SSH only.
+// The filerestore user / helper are not installed, so operator guest SSH fails.
+func setupTestVMWithoutGuestHelper(nsPrefix string, extraDisks ...ExtraDisk) *TestEnv {
+	return setupTestVMWithOptions(nsPrefix, setupTestVMOptions{skipGuestHelper: true}, extraDisks...)
+}
+
+// newTestEnv creates clients and a unique namespace with cleanup registered.
+func newTestEnv(nsPrefix string) *TestEnv {
 	env := &TestEnv{}
 
 	ginkgo.By("initializing Kubernetes clients")
@@ -85,11 +109,27 @@ func setupTestVM(nsPrefix string, extraDisks ...ExtraDisk) *TestEnv {
 	_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "Created test namespace: %s\n", env.Namespace)
 
 	ginkgo.DeferCleanup(func() {
-		ginkgo.By("cleaning up test resources")
+		ginkgo.By("cleaning up test namespace")
+		_ = env.K8sClient.CoreV1().Namespaces().Delete(context.Background(), env.Namespace, metav1.DeleteOptions{})
+	})
+
+	return env
+}
+
+// setupTestEnv creates clients and a unique namespace without a VM.
+// Useful for admission/reconcile validation that fails before needing a target VMI.
+func setupTestEnv(nsPrefix string) *TestEnv {
+	return newTestEnv(nsPrefix)
+}
+
+func setupTestVMWithOptions(nsPrefix string, opts setupTestVMOptions, extraDisks ...ExtraDisk) *TestEnv {
+	env := newTestEnv(nsPrefix)
+
+	ginkgo.DeferCleanup(func() {
+		ginkgo.By("cleaning up test SSH key material")
 		if env.PrivateKeyPath != "" {
 			_ = os.RemoveAll(filepath.Dir(env.PrivateKeyPath))
 		}
-		_ = env.K8sClient.CoreV1().Namespaces().Delete(context.Background(), env.Namespace, metav1.DeleteOptions{})
 	})
 
 	ginkgo.By("generating temporary SSH keypair")
@@ -117,28 +157,55 @@ func setupTestVM(nsPrefix string, extraDisks ...ExtraDisk) *TestEnv {
 	err = createTestVM(env.VirtClient, env.Namespace, vmName, pubKey, bootDiskName, bootDiskSize, extraDisks...)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create VM")
 
+	vmRunningTimeout := 10 * time.Minute
+	sshReadyTimeout := 10 * time.Minute
+	dvNames := make([]string, 0, 1+len(extraDisks))
+	dvNames = append(dvNames, bootDiskName)
+	for _, d := range extraDisks {
+		dvNames = append(dvNames, d.Name)
+	}
+	ginkgo.By("waiting for VM DataVolumes to be ready")
+	waitForDataVolumesReady(env.CRClient, env.Namespace, vmRunningTimeout, dvNames...)
+
 	ginkgo.By("waiting for VM to reach Running state")
 	gomega.Eventually(func(g gomega.Gomega) {
 		vmi, err := env.VirtClient.VirtualMachineInstance(env.Namespace).Get(
 			context.Background(), vmName, metav1.GetOptions{},
 		)
 		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get VMI")
-		g.Expect(vmi.Status.Phase).To(gomega.Equal(kubevirtv1.Running), "VMI not running")
-	}, 5*time.Minute, 10*time.Second).Should(gomega.Succeed())
+		g.Expect(vmi.Status.Phase).To(gomega.Equal(kubevirtv1.Running),
+			"VMI not running (%s)", vmiStatusDetail(vmi))
+	}, vmRunningTimeout, 10*time.Second).Should(gomega.Succeed())
 
 	ginkgo.By("waiting for SSH connectivity")
 	gomega.Eventually(func(g gomega.Gomega) {
 		_, err := runSSHCommand(vmName, env.Namespace, "echo ready", env.PrivateKeyPath)
 		g.Expect(err).NotTo(gomega.HaveOccurred(), "SSH not ready")
-	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed())
+	}, sshReadyTimeout, 15*time.Second).Should(gomega.Succeed())
 
-	ginkgo.By("installing guest helper with operator's SSH key")
-	gomega.Eventually(func(g gomega.Gomega) {
-		err := installGuestHelper(vmName, env.Namespace, operatorPubKey, env.PrivateKeyPath)
-		g.Expect(err).NotTo(gomega.HaveOccurred(), "Guest helper installation failed")
-	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed())
+	if !opts.skipGuestHelper {
+		ginkgo.By("installing guest helper with operator's SSH key")
+		gomega.Eventually(func(g gomega.Gomega) {
+			err := installGuestHelper(vmName, env.Namespace, operatorPubKey, env.PrivateKeyPath)
+			g.Expect(err).NotTo(gomega.HaveOccurred(), "Guest helper installation failed")
+		}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed())
+	}
 
 	return env
+}
+
+// vmiStatusDetail formats VMI phase and notable conditions for failure messages.
+func vmiStatusDetail(vmi *kubevirtv1.VirtualMachineInstance) string {
+	if vmi == nil {
+		return "VMI is nil"
+	}
+	parts := []string{fmt.Sprintf("phase=%s", vmi.Status.Phase)}
+	for _, cond := range vmi.Status.Conditions {
+		if cond.Status != corev1.ConditionTrue {
+			parts = append(parts, fmt.Sprintf("%s=%s", cond.Type, cond.Message))
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 // initClients creates and returns Kubernetes, KubeVirt, snapshot, and controller-runtime clients
@@ -183,6 +250,9 @@ func initClients() (
 	}
 	if err := kubevirtv1.AddToScheme(scheme); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("failed to add kubevirt scheme: %w", err)
+	}
+	if err := cdiv1beta1.AddToScheme(scheme); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed to add cdi scheme: %w", err)
 	}
 
 	// Create controller-runtime client for typed access to our CRs
@@ -374,6 +444,21 @@ users:
 	return nil
 }
 
+// waitForDataVolumesReady waits until each named DataVolume reaches Succeeded.
+func waitForDataVolumesReady(crClient client.Client, namespace string, timeout time.Duration, names ...string) {
+	for _, name := range names {
+		dvName := name
+		gomega.Eventually(func(g gomega.Gomega) {
+			current := &cdiv1beta1.DataVolume{}
+			g.Expect(crClient.Get(context.Background(), client.ObjectKey{
+				Namespace: namespace, Name: dvName,
+			}, current)).To(gomega.Succeed(), "Failed to get DataVolume %s", dvName)
+			g.Expect(current.Status.Phase).To(gomega.Equal(cdiv1beta1.Succeeded),
+				"DataVolume %s not Succeeded (phase: %s)", dvName, current.Status.Phase)
+		}, timeout, 10*time.Second).Should(gomega.Succeed())
+	}
+}
+
 // createVolumeSnapshot creates a VolumeSnapshot for the VM's disk PVC
 func createVolumeSnapshot(
 	snapshotClient snapshotclientset.Interface,
@@ -464,8 +549,8 @@ func createVolumeSnapshot(
 	return nil
 }
 
-// createFileRestoreCR creates a VirtualMachineFileRestore custom resource
-func createFileRestoreCR(crClient client.Client, ns, restoreName, targetVM, snapshot, sourcePath string) error {
+// createFileRestoreCR creates a VirtualMachineFileRestore custom resource from a VolumeSnapshot.
+func createFileRestoreCR(crClient client.Client, ns, restoreName, snapshot, sourcePath string) error {
 	restore := &filerestorev1alpha1.VirtualMachineFileRestore{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      restoreName,
@@ -473,9 +558,9 @@ func createFileRestoreCR(crClient client.Client, ns, restoreName, targetVM, snap
 		},
 		Spec: filerestorev1alpha1.VirtualMachineFileRestoreSpec{
 			Target: corev1.TypedLocalObjectReference{
-				APIGroup: func() *string { s := "kubevirt.io"; return &s }(),
+				APIGroup: kubevirtAPIGroupPtr(),
 				Kind:     "VirtualMachine",
-				Name:     targetVM,
+				Name:     vmName,
 			},
 			Source: filerestorev1alpha1.RestoreSource{
 				Snapshot: &filerestorev1alpha1.VolumeSnapshotSource{
@@ -487,6 +572,244 @@ func createFileRestoreCR(crClient client.Client, ns, restoreName, targetVM, snap
 	}
 
 	return crClient.Create(context.Background(), restore)
+}
+
+// createFileRestoreCRFromPVC creates a VirtualMachineFileRestore CR with a PVC source.
+func createFileRestoreCRFromPVC(crClient client.Client, ns, restoreName, targetVM, pvcName, sourcePath string) error {
+	restore := &filerestorev1alpha1.VirtualMachineFileRestore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      restoreName,
+			Namespace: ns,
+		},
+		Spec: filerestorev1alpha1.VirtualMachineFileRestoreSpec{
+			Target: corev1.TypedLocalObjectReference{
+				APIGroup: kubevirtAPIGroupPtr(),
+				Kind:     "VirtualMachine",
+				Name:     targetVM,
+			},
+			Source: filerestorev1alpha1.RestoreSource{
+				PVC: &filerestorev1alpha1.PVCSource{
+					Name: pvcName,
+				},
+			},
+			SourcePath: sourcePath,
+		},
+	}
+
+	return crClient.Create(context.Background(), restore)
+}
+
+// waitForVolumeSnapshotReady waits until the named VolumeSnapshot is ReadyToUse.
+func waitForVolumeSnapshotReady(
+	snapshotClient snapshotclientset.Interface, namespace, snapName string,
+) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		snapshot, err := snapshotClient.SnapshotV1().VolumeSnapshots(namespace).Get(
+			context.Background(), snapName, metav1.GetOptions{},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get VolumeSnapshot")
+		g.Expect(snapshot.Status).NotTo(gomega.BeNil(), "VolumeSnapshot has no status")
+		g.Expect(snapshot.Status.ReadyToUse).NotTo(gomega.BeNil(), "VolumeSnapshot ReadyToUse is nil")
+		g.Expect(*snapshot.Status.ReadyToUse).To(gomega.BeTrue(), "VolumeSnapshot not ready")
+	}, 3*time.Minute, 10*time.Second).Should(gomega.Succeed())
+}
+
+// createPVCFromSnapshot creates a CDI DataVolume from a VolumeSnapshot and waits until
+// the clone finishes. Bound alone is not enough: with CDI snapshot cloning the PVC can
+// bind while the DataVolume is still importing, so we wait for DataVolume Succeeded.
+func createPVCFromSnapshot(
+	crClient client.Client, k8sClient *kubernetes.Clientset, namespace, snapName, pvcName string,
+) {
+	dv := &cdiv1beta1.DataVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName,
+			Namespace: namespace,
+		},
+		Spec: cdiv1beta1.DataVolumeSpec{
+			Source: &cdiv1beta1.DataVolumeSource{
+				Snapshot: &cdiv1beta1.DataVolumeSourceSnapshot{
+					Namespace: namespace,
+					Name:      snapName,
+				},
+			},
+			Storage: &cdiv1beta1.StorageSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{
+					corev1.ReadWriteOnce,
+				},
+			},
+		},
+	}
+	gomega.Expect(crClient.Create(context.Background(), dv)).To(gomega.Succeed(),
+		"failed to create DataVolume from snapshot")
+
+	gomega.Eventually(func(g gomega.Gomega) {
+		current := &cdiv1beta1.DataVolume{}
+		g.Expect(crClient.Get(context.Background(), client.ObjectKey{
+			Namespace: namespace, Name: pvcName,
+		}, current)).To(gomega.Succeed(), "Failed to get DataVolume from snapshot")
+		g.Expect(current.Status.Phase).To(gomega.Equal(cdiv1beta1.Succeeded),
+			"DataVolume not Succeeded (phase: %s)", current.Status.Phase)
+
+		pvc, err := k8sClient.CoreV1().PersistentVolumeClaims(namespace).Get(
+			context.Background(), pvcName, metav1.GetOptions{},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get PVC from snapshot")
+		g.Expect(pvc.Status.Phase).To(gomega.Equal(corev1.ClaimBound), "PVC not Bound")
+	}, 5*time.Minute, 10*time.Second).Should(gomega.Succeed())
+}
+
+// getFileRestore returns the current VirtualMachineFileRestore CR.
+func getFileRestore(crClient client.Client, ns, name string) *filerestorev1alpha1.VirtualMachineFileRestore {
+	restore := &filerestorev1alpha1.VirtualMachineFileRestore{}
+	err := crClient.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, restore)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get restore CR %s/%s", ns, name)
+	return restore
+}
+
+// waitForRestorePhase waits until the restore CR reaches the expected phase.
+func waitForRestorePhase(
+	crClient client.Client, ns, name string, phase filerestorev1alpha1.RestorePhase,
+) *filerestorev1alpha1.VirtualMachineFileRestore {
+	var restore *filerestorev1alpha1.VirtualMachineFileRestore
+	gomega.Eventually(func(g gomega.Gomega) {
+		restore = &filerestorev1alpha1.VirtualMachineFileRestore{}
+		err := crClient.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, restore)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get restore CR")
+		switch {
+		case phase != filerestorev1alpha1.RestorePhaseFailed &&
+			restore.Status.Phase == filerestorev1alpha1.RestorePhaseFailed:
+			gomega.StopTrying(fmt.Sprintf("restore reached Failed before %s: %s",
+				phase, restore.Status.ErrorMessage)).Now()
+		case phase != filerestorev1alpha1.RestorePhaseSucceeded &&
+			restore.Status.Phase == filerestorev1alpha1.RestorePhaseSucceeded:
+			gomega.StopTrying(fmt.Sprintf("restore reached Succeeded before %s", phase)).Now()
+		}
+		g.Expect(restore.Status.Phase).To(gomega.Equal(phase),
+			fmt.Sprintf("Restore phase is %s, error: %s", restore.Status.Phase, restore.Status.ErrorMessage))
+	}, 5*time.Minute, 10*time.Second).Should(gomega.Succeed())
+	return restore
+}
+
+// waitForRestoreFailed waits until the restore CR reaches Failed with a non-empty error message.
+func waitForRestoreFailed(
+	crClient client.Client, ns, name string, timeout time.Duration,
+) *filerestorev1alpha1.VirtualMachineFileRestore {
+	var restore *filerestorev1alpha1.VirtualMachineFileRestore
+	gomega.Eventually(func(g gomega.Gomega) {
+		restore = &filerestorev1alpha1.VirtualMachineFileRestore{}
+		err := crClient.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, restore)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get restore CR")
+		if restore.Status.Phase == filerestorev1alpha1.RestorePhaseSucceeded {
+			gomega.StopTrying("restore reached Succeeded instead of Failed").Now()
+		}
+		g.Expect(restore.Status.Phase).To(gomega.Equal(filerestorev1alpha1.RestorePhaseFailed),
+			fmt.Sprintf("Restore phase is %s", restore.Status.Phase))
+		g.Expect(restore.Status.ErrorMessage).NotTo(gomega.BeEmpty(), "Expected non-empty errorMessage")
+	}, timeout, 10*time.Second).Should(gomega.Succeed())
+	return restore
+}
+
+// restoreVolumeName returns the hotplug volume name used by the operator for a restore CR.
+func restoreVolumeName(restoreCRName string) string {
+	return controller.GetVolumeName(restoreCRName)
+}
+
+// vmiHasRestoreVolume reports whether the VMI still has the restore hotplug volume attached.
+func vmiHasRestoreVolume(virtClient kubecli.KubevirtClient, namespace, vmiName, restoreCRName string) (bool, error) {
+	vmi, err := virtClient.VirtualMachineInstance(namespace).Get(context.Background(), vmiName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	want := restoreVolumeName(restoreCRName)
+	for _, vol := range vmi.Status.VolumeStatus {
+		if vol.Name == want {
+			return true, nil
+		}
+	}
+	for _, vol := range vmi.Spec.Volumes {
+		if vol.Name == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// assertRestoreVolumeDetached asserts the restore hotplug volume is gone from the VMI.
+func assertRestoreVolumeDetached(virtClient kubecli.KubevirtClient, namespace, vmiName, restoreCRName string) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		present, err := vmiHasRestoreVolume(virtClient, namespace, vmiName, restoreCRName)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(present).To(gomega.BeFalse(), "restore volume still attached to VMI")
+	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+}
+
+// assertNoManagedRestoreDataVolume asserts no operator-managed restore DataVolume remains for the CR.
+func assertNoManagedRestoreDataVolume(crClient client.Client, namespace, restoreCRName string) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		dv := &cdiv1beta1.DataVolume{}
+		err := crClient.Get(context.Background(),
+			client.ObjectKey{Namespace: namespace, Name: restoreVolumeName(restoreCRName)}, dv)
+		g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(),
+			"expected restore DataVolume to be deleted, got: %v", err)
+	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+}
+
+// assertSuccessfulRestoreCleanup checks temporary resources are removed after Succeeded (TS-009).
+func assertSuccessfulRestoreCleanup(
+	virtClient kubecli.KubevirtClient,
+	crClient client.Client,
+	namespace, vmiName, restoreCRName string,
+	snapshotSource bool,
+) {
+	ginkgo.By("verifying hotplugged restore volume is detached")
+	assertRestoreVolumeDetached(virtClient, namespace, vmiName, restoreCRName)
+
+	if snapshotSource {
+		ginkgo.By("verifying temporary restore DataVolume was cleaned up")
+		assertNoManagedRestoreDataVolume(crClient, namespace, restoreCRName)
+	}
+
+	ginkgo.By("verifying restore CR remains Succeeded for audit")
+	restore := getFileRestore(crClient, namespace, restoreCRName)
+	gomega.Expect(restore.Status.Phase).To(gomega.Equal(filerestorev1alpha1.RestorePhaseSucceeded))
+}
+
+// getFileModeFromVM returns the octal mode bits for a file in the guest.
+func getFileModeFromVM(vmiName, namespace, filePath, identityFile string) (string, error) {
+	return runSSHCommand(vmiName, namespace, fmt.Sprintf("stat -c %%a %s", shellEscape(filePath)), identityFile)
+}
+
+// getFileOwnerGroupFromVM returns "user:group" ownership for a file in the guest.
+func getFileOwnerGroupFromVM(vmiName, namespace, filePath, identityFile string) (string, error) {
+	return runSSHCommand(vmiName, namespace, fmt.Sprintf("stat -c %%U:%%G %s", shellEscape(filePath)), identityFile)
+}
+
+// startConnectivityProbe runs SSH echo checks every interval until stop is closed.
+// Read failures with failures.Load() after closing stop and waiting on done.
+func startConnectivityProbe(
+	vmiName, namespace, identityFile string, interval time.Duration,
+) (stop chan struct{}, failures *atomic.Int32, done chan struct{}) {
+	stop = make(chan struct{})
+	done = make(chan struct{})
+	failures = &atomic.Int32{}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if _, err := runSSHCommandWithTimeout(vmiName, namespace, "echo ok", identityFile, 15*time.Second); err != nil {
+					failures.Add(1)
+					_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "connectivity probe failure: %v\n", err)
+				}
+			}
+		}
+	}()
+	return stop, failures, done
 }
 
 // createFileRestoreOperatorCR creates the operator configuration CR via the API

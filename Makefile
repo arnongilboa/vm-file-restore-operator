@@ -163,7 +163,11 @@ cluster-sync: ## Deploy the operator to kubevirtci cluster
 test-e2e: manifests generate fmt vet ## Run e2e tests (requires kubevirtci cluster running)
 	@echo "Running e2e tests against kubevirtci cluster..."
 	@echo "NOTE: Ensure kubevirtci cluster is running with 'make cluster-up'"
-	go test ./test/e2e/ -v -ginkgo.v -timeout=30m
+	@test -n '$(E2E_TEST_CMD)' || { echo "Error: E2E_TEST_CMD is empty. Unset it to use the default or set it to the e2e test command." >&2; exit 1; }
+	$(E2E_TEST_CMD)
+
+E2E_TIMEOUT ?= 90m
+E2E_TEST_CMD ?= go test ./test/e2e/ -v -ginkgo.v -timeout=$(E2E_TIMEOUT)
 
 ##@ Script Tests
 

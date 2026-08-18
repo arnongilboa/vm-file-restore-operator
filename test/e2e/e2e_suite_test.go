@@ -57,7 +57,3 @@ var _ = BeforeSuite(func() {
 		"Operator deployment not found in namespace %q. Deploy the operator before running tests "+
 			"(e.g. 'make cluster-sync' or QE setup.sh).", operatorNamespace())
 })
-
-var _ = AfterSuite(func() {
-	// Nothing to clean up - operator stays running for debugging
-})
