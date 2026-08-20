@@ -55,6 +55,7 @@ type VirtualMachineFileRestoreReconciler struct {
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents,verbs=get
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;delete
