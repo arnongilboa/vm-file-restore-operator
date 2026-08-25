@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,6 +25,42 @@ func GetVolumeName(crName string) string {
 		panic("GetVolumeName called with empty crName")
 	}
 	return crName + "-restore"
+}
+
+// getSnapshotSourceVolumeMode returns the volume mode recorded on the VolumeSnapshotContent
+// bound to the given VolumeSnapshot (spec.sourceVolumeMode). It returns nil when the mode
+// cannot be determined - the snapshot has no bound content yet, or sourceVolumeMode is unset -
+// so the caller leaves the DataVolume volume mode empty and lets CDI fall back to the default.
+// Reads use the uncached reader to avoid starting cluster-wide informers on snapshot resources.
+func getSnapshotSourceVolumeMode(ctx context.Context, apiReader client.Reader, snapshotName, snapshotNamespace string) (*corev1.PersistentVolumeMode, error) {
+	logger := log.FromContext(ctx)
+
+	snapshot := &snapshotv1.VolumeSnapshot{}
+	if err := apiReader.Get(ctx, client.ObjectKey{Name: snapshotName, Namespace: snapshotNamespace}, snapshot); err != nil {
+		return nil, fmt.Errorf("failed to get VolumeSnapshot %s/%s: %w", snapshotNamespace, snapshotName, err)
+	}
+
+	if snapshot.Status == nil || snapshot.Status.BoundVolumeSnapshotContentName == nil || *snapshot.Status.BoundVolumeSnapshotContentName == "" {
+		logger.Info("VolumeSnapshot has no bound VolumeSnapshotContent yet, leaving DataVolume volume mode empty (default)",
+			"volumeSnapshot", snapshotName, "namespace", snapshotNamespace)
+		return nil, nil
+	}
+	contentName := *snapshot.Status.BoundVolumeSnapshotContentName
+
+	content := &snapshotv1.VolumeSnapshotContent{}
+	if err := apiReader.Get(ctx, client.ObjectKey{Name: contentName}, content); err != nil {
+		return nil, fmt.Errorf("failed to get VolumeSnapshotContent %s: %w", contentName, err)
+	}
+
+	if content.Spec.SourceVolumeMode == nil || *content.Spec.SourceVolumeMode == "" {
+		logger.Info("VolumeSnapshotContent.spec.sourceVolumeMode is not set, leaving DataVolume volume mode empty (default)",
+			"volumeSnapshotContent", contentName)
+		return nil, nil
+	}
+
+	logger.Info("Deriving DataVolume volume mode from VolumeSnapshotContent.spec.sourceVolumeMode",
+		"volumeSnapshotContent", contentName, "volumeMode", *content.Spec.SourceVolumeMode)
+	return content.Spec.SourceVolumeMode, nil
 }
 
 // HotplugVolume hotplugs a restore volume to the target VM.
@@ -91,52 +128,69 @@ func HotplugVolume(ctx context.Context, c client.Client, apiReader client.Reader
 			},
 		}
 	} else if vmfr.Spec.Source.Snapshot != nil {
-		// Snapshot source: create DataVolume with empty storage spec
-		// DataVolume will automatically inherit access mode, volume mode, and size from snapshot
+		// Snapshot source: restore the PVC from the snapshot via a DataVolume.
 		snapshotNamespace := vmfr.Spec.Source.Snapshot.Namespace
 		if snapshotNamespace == "" {
 			snapshotNamespace = vmfr.Namespace
 		}
 
-		dataVolume := &cdiv1beta1.DataVolume{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      volumeName,
-				Namespace: vmfr.Namespace,
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "vm-file-restore-operator",
-					"filerestore.kubevirt.io/name": vmfr.Name,
-				},
-			},
-			Spec: cdiv1beta1.DataVolumeSpec{
-				Source: &cdiv1beta1.DataVolumeSource{
-					Snapshot: &cdiv1beta1.DataVolumeSourceSnapshot{
-						Namespace: snapshotNamespace,
-						Name:      vmfr.Spec.Source.Snapshot.Name,
-					},
-				},
-				Storage: &cdiv1beta1.StorageSpec{
-					AccessModes: []corev1.PersistentVolumeAccessMode{
-						corev1.ReadWriteOnce,
-					},
-				},
-			},
-		}
+		// Read the DataVolume first (uncached, to avoid cache lag). Deriving the volume
+		// mode and creating the DataVolume only happens when it doesn't exist yet, so we
+		// don't re-read the snapshot resources on every requeue while it provisions.
+		dvKey := client.ObjectKey{Name: volumeName, Namespace: vmfr.Namespace}
+		dataVolume := &cdiv1beta1.DataVolume{}
+		err := apiReader.Get(ctx, dvKey, dataVolume)
+		if errors.IsNotFound(err) {
+			// Derive the volume mode from the bound VolumeSnapshotContent's sourceVolumeMode.
+			// This read is best-effort: if it fails we log and fall back to an empty volume
+			// mode (CDI default) rather than failing the restore, so the feature never blocks
+			// a restore that would otherwise succeed.
+			volumeMode, modeErr := getSnapshotSourceVolumeMode(ctx, apiReader, vmfr.Spec.Source.Snapshot.Name, snapshotNamespace)
+			if modeErr != nil {
+				logger.Info("Could not determine source volume mode, using CDI default", "error", modeErr)
+				volumeMode = nil
+			}
 
-		// Create DataVolume, verify if already exists
-		if err := c.Create(ctx, dataVolume); err != nil {
-			if !errors.IsAlreadyExists(err) {
+			dataVolume = &cdiv1beta1.DataVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      volumeName,
+					Namespace: vmfr.Namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "vm-file-restore-operator",
+						"filerestore.kubevirt.io/name": vmfr.Name,
+					},
+				},
+				Spec: cdiv1beta1.DataVolumeSpec{
+					Source: &cdiv1beta1.DataVolumeSource{
+						Snapshot: &cdiv1beta1.DataVolumeSourceSnapshot{
+							Namespace: snapshotNamespace,
+							Name:      vmfr.Spec.Source.Snapshot.Name,
+						},
+					},
+					Storage: &cdiv1beta1.StorageSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{
+							corev1.ReadWriteOnce,
+						},
+						VolumeMode: volumeMode,
+					},
+				},
+			}
+
+			// Create DataVolume; re-read after create to observe its status. Tolerate
+			// AlreadyExists in case it was created concurrently since the Get above.
+			if err := c.Create(ctx, dataVolume); err != nil && !errors.IsAlreadyExists(err) {
 				return fmt.Errorf("failed to create DataVolume from snapshot: %w", err)
 			}
-		}
-
-		// Wait for DataVolume to be Succeeded (use direct API reader to avoid cache lag)
-		existing := &cdiv1beta1.DataVolume{}
-		if err := apiReader.Get(ctx, client.ObjectKey{Name: volumeName, Namespace: vmfr.Namespace}, existing); err != nil {
+			if err := apiReader.Get(ctx, dvKey, dataVolume); err != nil {
+				return fmt.Errorf("failed to get DataVolume: %w", err)
+			}
+		} else if err != nil {
 			return fmt.Errorf("failed to get DataVolume: %w", err)
 		}
-		if existing.Status.Phase != cdiv1beta1.Succeeded {
+
+		if dataVolume.Status.Phase != cdiv1beta1.Succeeded {
 			// This is a transient condition - caller will retry
-			return NewTransientError(fmt.Sprintf("DataVolume is provisioning (phase: %s), will retry", existing.Status.Phase))
+			return NewTransientError(fmt.Sprintf("DataVolume is provisioning (phase: %s), will retry", dataVolume.Status.Phase))
 		}
 
 		volumeSource = v1.VolumeSource{

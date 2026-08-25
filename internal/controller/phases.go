@@ -22,10 +22,10 @@ import (
 	"strings"
 	"time"
 
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	v1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -276,9 +276,7 @@ func handleInitPhase(ctx context.Context, r *VirtualMachineFileRestoreReconciler
 			return failRestore(ctx, r, vmfr, err, "failed to get source PVC")
 		}
 	} else if vmfr.Spec.Source.Snapshot != nil {
-		snapshot := &unstructured.Unstructured{}
-		snapshot.SetAPIVersion("snapshot.storage.k8s.io/v1")
-		snapshot.SetKind("VolumeSnapshot")
+		snapshot := &snapshotv1.VolumeSnapshot{}
 		snapshotNamespace := vmfr.Spec.Source.Snapshot.Namespace
 		if snapshotNamespace == "" {
 			snapshotNamespace = vmfr.Namespace
