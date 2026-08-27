@@ -573,9 +573,16 @@ func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreRecon
 
 	logger.Info("Executing restore command", "command", command)
 
-	// Run command
-	stdout, stderr, err := sshClient.RunCommand(ctx, command)
+	// Run command with timeout (issue #29)
+	// If rsync hangs (frozen filesystem, network stall, NFS deadlock), fail fast instead of waiting indefinitely
+	restoreCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	stdout, stderr, err := sshClient.RunCommand(restoreCtx, command)
 	if err != nil {
+		// Distinguish timeout from other errors for better debugging
+		if restoreCtx.Err() == context.DeadlineExceeded {
+			return failRestore(ctx, r, vmfr, fmt.Errorf("restore command timeout"), "restore command timed out after 10 minutes")
+		}
 		detail := fmt.Sprintf("restore command failed: %s\nstdout: %s\nstderr: %s", err.Error(), TruncateOutput(stdout, 50), TruncateOutput(stderr, 50))
 		return failRestore(ctx, r, vmfr, err, detail)
 	}
