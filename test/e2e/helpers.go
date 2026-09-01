@@ -145,13 +145,15 @@ func setupTestVMWithOptions(nsPrefix string, opts setupTestVMOptions, extraDisks
 	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to read public key")
 	pubKey := strings.TrimSpace(string(pubKeyBytes))
 
-	ginkgo.By("fetching operator's SSH public key from ConfigMap")
+	ginkgo.By("fetching operator SSH public key and guest helpers from ConfigMap")
 	cm, err := env.K8sClient.CoreV1().ConfigMaps(operatorNamespace()).Get(
 		context.Background(), operatorSSHConfigMapName(), metav1.GetOptions{},
 	)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get operator SSH ConfigMap")
-	operatorPubKey := cm.Data["ssh-publickey"]
+	operatorPubKey := strings.TrimSpace(cm.Data["ssh-publickey"])
 	gomega.Expect(operatorPubKey).NotTo(gomega.BeEmpty(), "Operator SSH public key is empty")
+	linuxHelperTar := cm.BinaryData["linux-helpers.tar"]
+	gomega.Expect(linuxHelperTar).NotTo(gomega.BeEmpty(), "linux-helpers.tar not found in operator ConfigMap")
 
 	ginkgo.By("creating test VirtualMachine")
 	err = createTestVM(env.VirtClient, env.Namespace, vmName, pubKey, bootDiskName, bootDiskSize, extraDisks...)
@@ -186,7 +188,7 @@ func setupTestVMWithOptions(nsPrefix string, opts setupTestVMOptions, extraDisks
 	if !opts.skipGuestHelper {
 		ginkgo.By("installing guest helper with operator's SSH key")
 		gomega.Eventually(func(g gomega.Gomega) {
-			err := installGuestHelper(vmName, env.Namespace, operatorPubKey, env.PrivateKeyPath)
+			err := installGuestHelper(vmName, env.Namespace, operatorPubKey, linuxHelperTar, env.PrivateKeyPath)
 			g.Expect(err).NotTo(gomega.HaveOccurred(), "Guest helper installation failed")
 		}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed())
 	}

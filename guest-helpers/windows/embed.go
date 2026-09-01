@@ -14,18 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package linuxhelpers embeds the Linux guest helper scripts so test binaries
-// can install them without a git checkout (e.g. QE / Konflux test images).
-package linuxhelpers
+// Package windowshelpers embeds the Windows guest helper scripts so the operator
+// can distribute them via ConfigMap without requiring a git checkout.
+package windowshelpers
 
 import "embed"
 
-// Scripts contains setup.sh and filerestore.sh from this directory.
+// Scripts contains setup.bat and filerestore.bat from this directory.
 //
-//go:embed setup.sh filerestore.sh
+//go:embed setup.bat filerestore.bat
 var Scripts embed.FS
 
 const (
-	SetupScriptName       = "setup.sh"
-	FileRestoreScriptName = "filerestore.sh"
+	SetupScriptName       = "setup.bat"
+	FileRestoreScriptName = "filerestore.bat"
 )
