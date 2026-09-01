@@ -48,7 +48,7 @@ func metricsClusterRoleBindingName(operatorNS string) string {
 	return fmt.Sprintf("%s-%s", metricsRoleBindingName, operatorNS)
 }
 
-var _ = Describe("Manager", Ordered, func() {
+var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 	var namespace string // operator namespace (configurable for QE)
 
 	// Operator and namespace are already deployed via 'make cluster-sync' or QE setup.sh
@@ -222,460 +222,604 @@ var _ = Describe("Manager", Ordered, func() {
 
 			By("getting the metrics by checking curl-metrics logs")
 			metricsOutput := getMetricsOutput(namespace)
-			Expect(metricsOutput).To(ContainSubstring(
-				"controller_runtime_reconcile_total",
-			))
+			// rest_client_requests_total is emitted at operator startup (no CR needed),
+			// confirming controller-runtime metrics are wired up correctly.
+			Expect(metricsOutput).To(ContainSubstring("rest_client_requests_total"))
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
-		/*
-			Automatic restore from backup PVC with file integrity
 
-			Preconditions:
-				- Running Linux VM with guest helper and filerestore SSH user configured
-				- Backup PVC populated with test files of known size, ownership, and permissions
-				- Original file metadata recorded before restore
+		Context("standard restore operations", Ordered, func() {
+			var sharedEnv *TestEnv
+			BeforeAll(func() {
+				sharedEnv = setupTestVM("e2e-shared")
+			})
 
-			Steps:
-				1. Create VirtualMachineFileRestore CR in automatic mode with the backup PVC as source
-				2. Wait for VirtualMachineFileRestore to reach Succeeded phase
-				3. Verify restored file exists at target path with matching metadata
-				4. Verify temporary hotplug resources were cleaned up
+			/*
+					Automatic restore from backup PVC with file integrity
 
-			Expected: Restored file matches pre-restore size, ownership, and permissions
-		*/
-		It("should restore files from a backup PVC to a running Linux VM with file integrity preserved", func() {
-			const (
-				pvcSnapName    = "fedora-pvc-source-snap"
-				backupPVCName  = "backup-pvc-from-snap"
-				pvcRestoreName = "restore-from-pvc"
-			)
+				Preconditions:
+					- Running Linux VM with guest helper and filerestore SSH user configured
+					- Backup PVC populated with test files of known size, ownership, and permissions
+					- Original file metadata recorded before restore
 
-			env := setupTestVM("e2e-pvc-restore")
+				Steps:
+					1. Create VirtualMachineFileRestore CR in automatic mode with the backup PVC as source
+					2. Wait for VirtualMachineFileRestore to reach Succeeded phase
+					3. Verify restored file exists at target path with matching metadata
+					4. Verify temporary hotplug resources were cleaned up
 
-			By("creating test user")
-			_, err := runSSHCommand(vmName, env.Namespace,
-				fmt.Sprintf("useradd -m -s /bin/bash %s", testUser), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
+				Expected: Restored file matches pre-restore size, ownership, and permissions
+			*/
+			It("should restore files from a backup PVC to a running Linux VM with file integrity preserved", func() {
+				const (
+					pvcSnapName    = "fedora-pvc-source-snap"
+					backupPVCName  = "backup-pvc-from-snap"
+					pvcRestoreName = "restore-from-pvc"
+				)
 
-			By("creating test file with known permissions")
-			createFileCmd := fmt.Sprintf(
-				"su - %s -c 'fallocate -l 64M %s && chmod 640 %s && sync'",
-				testUser, testFilePath, testFilePath,
-			)
-			_, err = runSSHCommand(vmName, env.Namespace, createFileCmd, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test file")
-			time.Sleep(2 * time.Second)
+				env := sharedEnv
+				DeferCleanup(func() {
+					deleteSnapshotIfExists(env, pvcSnapName)
+					deleteDVIfExists(env, backupPVCName)
+					deleteFileRestoreIfExists(env, pvcRestoreName)
+				})
 
-			By("recording original file metadata")
-			originalSize, err := getFileSizeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(originalSize).To(BeNumerically(">", 0))
-			originalOwner, err := getFileOwnerGroupFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-			originalMode, err := getFileModeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
+				By("creating test user")
+				_, err := runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("id %s &>/dev/null || useradd -m -s /bin/bash %s", testUser, testUser), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
 
-			By("creating VolumeSnapshot of boot disk")
-			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, pvcSnapName)
-			Expect(err).NotTo(HaveOccurred())
-			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, pvcSnapName)
+				By("creating test file with known permissions")
+				createFileCmd := fmt.Sprintf(
+					"su - %s -c 'fallocate -l 64M %s && chmod 640 %s && sync'",
+					testUser, testFilePath, testFilePath,
+				)
+				_, err = runSSHCommand(vmName, env.Namespace, createFileCmd, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test file")
+				time.Sleep(2 * time.Second)
 
-			By("creating backup PVC from VolumeSnapshot")
-			createPVCFromSnapshot(env.CRClient, env.K8sClient, env.Namespace, pvcSnapName, backupPVCName)
+				By("recording original file metadata")
+				originalSize, err := getFileSizeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(originalSize).To(BeNumerically(">", 0))
+				originalOwner, err := getFileOwnerGroupFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				originalMode, err := getFileModeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
 
-			By("deleting the test file to verify restore")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -f %s", testFilePath), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -f %s", testFilePath), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "File was not deleted")
+				By("creating VolumeSnapshot of boot disk")
+				err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, pvcSnapName)
+				Expect(err).NotTo(HaveOccurred())
+				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, pvcSnapName)
 
-			By("creating VirtualMachineFileRestore CR with PVC source")
-			err = createFileRestoreCRFromPVC(
-				env.CRClient, env.Namespace, pvcRestoreName, vmName, backupPVCName, fmt.Sprintf("/home/%s", testUser),
-			)
-			Expect(err).NotTo(HaveOccurred())
+				By("creating backup PVC from VolumeSnapshot")
+				createPVCFromSnapshot(env.CRClient, env.K8sClient, env.Namespace, pvcSnapName, backupPVCName)
 
-			By("waiting for restore to complete")
-			waitForRestorePhase(env.CRClient, env.Namespace, pvcRestoreName,
-				filerestorev1alpha1.RestorePhaseSucceeded)
+				By("deleting the test file to verify restore")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -f %s", testFilePath), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -f %s", testFilePath), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "File was not deleted")
 
-			By("verifying restored file integrity")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -f %s", testFilePath), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Restored file does not exist")
+				By("creating VirtualMachineFileRestore CR with PVC source")
+				err = createFileRestoreCRFromPVC(
+					env.CRClient, env.Namespace, pvcRestoreName, vmName, backupPVCName, fmt.Sprintf("/home/%s", testUser),
+				)
+				Expect(err).NotTo(HaveOccurred())
 
-			restoredSize, err := getFileSizeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(restoredSize).To(Equal(originalSize))
+				By("waiting for restore to complete")
+				waitForRestorePhase(env.CRClient, env.Namespace, pvcRestoreName,
+					filerestorev1alpha1.RestorePhaseSucceeded)
 
-			owner, err := getFileOwnerGroupFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(owner).To(Equal(originalOwner))
+				By("verifying restored file integrity")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -f %s", testFilePath), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Restored file does not exist")
 
-			mode, err := getFileModeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(mode).To(Equal(originalMode))
+				restoredSize, err := getFileSizeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(restoredSize).To(Equal(originalSize))
 
-			By("verifying temporary hotplug volume is detached (PVC source leaves the backup PVC)")
-			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, pvcRestoreName)
-		})
+				owner, err := getFileOwnerGroupFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(owner).To(Equal(originalOwner))
 
-		/*
-			Automatic restore from VolumeSnapshot while VM remains reachable.
+				mode, err := getFileModeFromVM(vmName, env.Namespace, testFilePath, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(mode).To(Equal(originalMode))
 
-			Preconditions:
-				- Running Linux VM with guest helper and filerestore SSH user configured
-				- VolumeSnapshot containing a directory tree (files + subdirectory)
-				- VM network connectivity baseline verified before restore
+				By("verifying temporary hotplug volume is detached (PVC source leaves the backup PVC)")
+				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, pvcRestoreName)
+			})
 
-			Steps:
-				1. Start background connectivity probe (SSH echo every 2s)
-				2. Create VirtualMachineFileRestore CR in automatic mode with VolumeSnapshot as source
-				3. Wait for restore to reach Succeeded while connectivity probe runs
-				4. Verify restored files and directories exist at the target path
-				5. Confirm VM still responds to connectivity checks after restore
+			/*
+				Automatic restore from VolumeSnapshot while VM remains reachable.
 
-			Expected: Restore succeeds with zero connectivity probe failures before/during/after;
-			files and directories are present at the target path
+				Preconditions:
+					- Running Linux VM with guest helper and filerestore SSH user configured
+					- VolumeSnapshot containing a directory tree (files + subdirectory)
+					- VM network connectivity baseline verified before restore
 
-		*/
-		It("should restore files and directories from VolumeSnapshot while the VM remains reachable", func() {
-			const (
-				restoreTreeDir = "/home/donald/restore-tree"
-				restoreFile    = "/home/donald/restore-tree/file1.txt"
-				restoreSubdir  = "/home/donald/restore-tree/subdir"
-				restoreNested  = "/home/donald/restore-tree/subdir/nested.txt"
-			)
+				Steps:
+					1. Start background connectivity probe (SSH echo every 2s)
+					2. Create VirtualMachineFileRestore CR in automatic mode with VolumeSnapshot as source
+					3. Wait for restore to reach Succeeded while connectivity probe runs
+					4. Verify restored files and directories exist at the target path
+					5. Confirm VM still responds to connectivity checks after restore
 
-			env := setupTestVM("e2e-filerestore")
+				Expected: Restore succeeds with zero connectivity probe failures before/during/after;
+				files and directories are present at the target path
 
-			By("creating test user")
-			useraddCmd := fmt.Sprintf("useradd -m -s /bin/bash %s", testUser)
-			_, err := runSSHCommand(vmName, env.Namespace, useraddCmd, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
+			*/
+			It("should restore files and directories from VolumeSnapshot while the VM remains reachable", func() {
+				const (
+					restoreTreeDir = "/home/donald/restore-tree"
+					restoreFile    = "/home/donald/restore-tree/file1.txt"
+					restoreSubdir  = "/home/donald/restore-tree/subdir"
+					restoreNested  = "/home/donald/restore-tree/subdir/nested.txt"
+				)
 
-			By("creating a directory tree with files and a subdirectory")
-			setupTree := fmt.Sprintf(`
+				env := sharedEnv
+				DeferCleanup(func() {
+					deleteSnapshotIfExists(env, snapshotName)
+					deleteFileRestoreIfExists(env, restoreCRName)
+				})
+
+				By("creating test user")
+				useraddCmd := fmt.Sprintf("id %s &>/dev/null || useradd -m -s /bin/bash %s", testUser, testUser)
+				_, err := runSSHCommand(vmName, env.Namespace, useraddCmd, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
+
+				By("creating a directory tree with files and a subdirectory")
+				setupTree := fmt.Sprintf(`
 mkdir -p %s
 echo 'top-level-content' > %s
 echo 'nested-content' > %s
 chown -R %s:%s %s
 sync
 `, restoreSubdir, restoreFile, restoreNested, testUser, testUser, restoreTreeDir)
-			_, err = runSSHCommand(vmName, env.Namespace, setupTree, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create restore directory tree")
-			time.Sleep(2 * time.Second)
+				_, err = runSSHCommand(vmName, env.Namespace, setupTree, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create restore directory tree")
+				time.Sleep(2 * time.Second)
 
-			By("creating VolumeSnapshot of boot disk")
-			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapshotName)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create VolumeSnapshot")
+				By("creating VolumeSnapshot of boot disk")
+				err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapshotName)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create VolumeSnapshot")
 
-			By("waiting for VolumeSnapshot to be ready")
-			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapshotName)
+				By("waiting for VolumeSnapshot to be ready")
+				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapshotName)
 
-			By("deleting the directory tree to verify restore")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -rf %s", restoreTreeDir), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to delete directory tree")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", restoreTreeDir), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Directory tree was not deleted")
+				By("deleting the directory tree to verify restore")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -rf %s", restoreTreeDir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to delete directory tree")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", restoreTreeDir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Directory tree was not deleted")
 
-			By("verifying baseline SSH connectivity before restore")
-			_, err = runSSHCommand(vmName, env.Namespace, "echo reachable", env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "VM not reachable before restore")
+				By("verifying baseline SSH connectivity before restore")
+				_, err = runSSHCommand(vmName, env.Namespace, "echo reachable", env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "VM not reachable before restore")
 
-			By("starting background connectivity probe")
-			stopProbe, probeFailures, probeDone := startConnectivityProbe(
-				vmName, env.Namespace, env.PrivateKeyPath, 2*time.Second,
-			)
-			var stopOnce sync.Once
-			DeferCleanup(func() {
+				By("starting background connectivity probe")
+				stopProbe, probeFailures, probeDone := startConnectivityProbe(
+					vmName, env.Namespace, env.PrivateKeyPath, 2*time.Second,
+				)
+				var stopOnce sync.Once
+				DeferCleanup(func() {
+					stopOnce.Do(func() { close(stopProbe) })
+					Eventually(probeDone, 30*time.Second).Should(BeClosed())
+				})
+
+				By("creating VirtualMachineFileRestore CR")
+				err = createFileRestoreCR(
+					env.CRClient, env.Namespace, restoreCRName, snapshotName, restoreTreeDir,
+				)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create restore CR")
+
+				By("waiting for restore to complete")
+				waitForRestorePhase(env.CRClient, env.Namespace, restoreCRName,
+					filerestorev1alpha1.RestorePhaseSucceeded)
+
 				stopOnce.Do(func() { close(stopProbe) })
 				Eventually(probeDone, 30*time.Second).Should(BeClosed())
+				Expect(probeFailures.Load()).To(BeNumerically("<=", 2),
+					"connectivity probe reported too many failures during restore")
+
+				By("verifying restored directories exist")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -d %s", restoreTreeDir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Restored top-level directory does not exist")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -d %s", restoreSubdir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Restored subdirectory does not exist")
+
+				By("verifying restored files exist with expected content")
+				topContent, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("cat %s", restoreFile), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Restored top-level file missing")
+				Expect(topContent).To(ContainSubstring("top-level-content"))
+				nestedContent, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("cat %s", restoreNested), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Restored nested file missing")
+				Expect(nestedContent).To(ContainSubstring("nested-content"))
+
+				By("verifying SSH connectivity after restore")
+				_, err = runSSHCommand(vmName, env.Namespace, "echo still-reachable", env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "VM not reachable after restore")
 			})
 
-			By("creating VirtualMachineFileRestore CR")
-			err = createFileRestoreCR(
-				env.CRClient, env.Namespace, restoreCRName, snapshotName, restoreTreeDir,
-			)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create restore CR")
+			/*
+				Manual restore mode: read-only mount, interactive copy, cleanup on delete.
 
-			By("waiting for restore to complete")
-			waitForRestorePhase(env.CRClient, env.Namespace, restoreCRName,
-				filerestorev1alpha1.RestorePhaseSucceeded)
+				Preconditions:
+					- Running Linux VM with guest helper and filerestore SSH user configured
+					- Backup snapshot populated with test files
 
-			stopOnce.Do(func() { close(stopProbe) })
-			Eventually(probeDone, 30*time.Second).Should(BeClosed())
-			Expect(probeFailures.Load()).To(BeNumerically("<=", 2),
-				"connectivity probe reported too many failures during restore")
+				Steps:
+					1. Create VirtualMachineFileRestore CR in manual mode (no sourcePath)
+					2. Wait for restore to reach VolumeReady phase
+					3. Verify backup volume is mounted read-only in the guest
+					4. Copy/read a file from the read-only backup mount
+					5. Delete the VirtualMachineFileRestore CR
+					6. Verify hotplugged backup volume is detached
 
-			By("verifying restored directories exist")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -d %s", restoreTreeDir), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Restored top-level directory does not exist")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -d %s", restoreSubdir), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Restored subdirectory does not exist")
+				Expected: Backup mounted read-only; files accessible for interactive copy;
+				resources detached on CR deletion
 
-			By("verifying restored files exist with expected content")
-			topContent, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("cat %s", restoreFile), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Restored top-level file missing")
-			Expect(topContent).To(ContainSubstring("top-level-content"))
-			nestedContent, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("cat %s", restoreNested), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Restored nested file missing")
-			Expect(nestedContent).To(ContainSubstring("nested-content"))
+			*/
+			It("should make backup available read-only in guest when manual restore", func() {
+				env := sharedEnv
+				DeferCleanup(func() {
+					deleteSnapshotIfExists(env, snapshotName)
+					deleteFileRestoreIfExists(env, "manual-restore-test")
+				})
 
-			By("verifying SSH connectivity after restore")
-			_, err = runSSHCommand(vmName, env.Namespace, "echo still-reachable", env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "VM not reachable after restore")
-		})
+				By(fmt.Sprintf("creating test user %s", testUser))
+				useraddCmd := fmt.Sprintf("id %s &>/dev/null || useradd -m -s /bin/bash %s", testUser, testUser)
+				_, err := runSSHCommand(vmName, env.Namespace, useraddCmd, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
 
-		/*
-			Manual restore mode: read-only mount, interactive copy, cleanup on delete.
+				By(fmt.Sprintf("creating test file in /home/%s", testUser))
+				testFileContent := "manual-restore-test-content-" + time.Now().String()
+				manualTestFile := fmt.Sprintf("/home/%s/test-manual-restore.txt", testUser)
+				createFileCmd := fmt.Sprintf("su - %s -c 'echo \"%s\" > %s' && sync", testUser, testFileContent, manualTestFile)
+				_, err = runSSHCommand(vmName, env.Namespace, createFileCmd, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test file")
 
-			Preconditions:
-				- Running Linux VM with guest helper and filerestore SSH user configured
-				- Backup snapshot populated with test files
+				By("syncing filesystem to ensure data is written")
+				_, err = runSSHCommand(vmName, env.Namespace, "sync", env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to sync filesystem")
+				time.Sleep(3 * time.Second)
 
-			Steps:
-				1. Create VirtualMachineFileRestore CR in manual mode (no sourcePath)
-				2. Wait for restore to reach VolumeReady phase
-				3. Verify backup volume is mounted read-only in the guest
-				4. Copy/read a file from the read-only backup mount
-				5. Delete the VirtualMachineFileRestore CR
-				6. Verify hotplugged backup volume is detached
+				By("verifying test file exists before snapshot")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -f %s", manualTestFile), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Test file does not exist before snapshot")
 
-			Expected: Backup mounted read-only; files accessible for interactive copy;
-			resources detached on CR deletion
+				By("creating VolumeSnapshot")
+				err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapshotName)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create snapshot")
 
-		*/
-		It("should make backup available read-only in guest when manual restore", func() {
-			env := setupTestVM("e2e-manual-restore")
+				By("waiting for snapshot to be ready")
+				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapshotName)
 
-			By(fmt.Sprintf("creating test user %s", testUser))
-			useraddCmd := fmt.Sprintf("useradd -m -s /bin/bash %s", testUser)
-			_, err := runSSHCommand(vmName, env.Namespace, useraddCmd, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
+				By("deleting the test file")
+				_, err = runSSHCommand(vmName, env.Namespace, "rm -f "+manualTestFile, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to delete test file")
 
-			By(fmt.Sprintf("creating test file in /home/%s", testUser))
-			testFileContent := "manual-restore-test-content-" + time.Now().String()
-			manualTestFile := fmt.Sprintf("/home/%s/test-manual-restore.txt", testUser)
-			createFileCmd := fmt.Sprintf("su - %s -c 'echo \"%s\" > %s' && sync", testUser, testFileContent, manualTestFile)
-			_, err = runSSHCommand(vmName, env.Namespace, createFileCmd, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test file")
-
-			By("syncing filesystem to ensure data is written")
-			_, err = runSSHCommand(vmName, env.Namespace, "sync", env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to sync filesystem")
-			time.Sleep(3 * time.Second)
-
-			By("verifying test file exists before snapshot")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -f %s", manualTestFile), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Test file does not exist before snapshot")
-
-			By("creating VolumeSnapshot")
-			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapshotName)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create snapshot")
-
-			By("waiting for snapshot to be ready")
-			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapshotName)
-
-			By("deleting the test file")
-			_, err = runSSHCommand(vmName, env.Namespace, "rm -f "+manualTestFile, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to delete test file")
-
-			By("creating manual-mode VirtualMachineFileRestore CR (no sourcePath)")
-			manualRestoreName := "manual-restore-test"
-			manualRestore := &filerestorev1alpha1.VirtualMachineFileRestore{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      manualRestoreName,
-					Namespace: env.Namespace,
-				},
-				Spec: filerestorev1alpha1.VirtualMachineFileRestoreSpec{
-					Target: corev1.TypedLocalObjectReference{
-						APIGroup: kubevirtAPIGroupPtr(),
-						Kind:     "VirtualMachine",
-						Name:     vmName,
+				By("creating manual-mode VirtualMachineFileRestore CR (no sourcePath)")
+				manualRestoreName := "manual-restore-test"
+				manualRestore := &filerestorev1alpha1.VirtualMachineFileRestore{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      manualRestoreName,
+						Namespace: env.Namespace,
 					},
-					Source: filerestorev1alpha1.RestoreSource{
-						Snapshot: &filerestorev1alpha1.VolumeSnapshotSource{
-							Name: snapshotName,
+					Spec: filerestorev1alpha1.VirtualMachineFileRestoreSpec{
+						Target: corev1.TypedLocalObjectReference{
+							APIGroup: kubevirtAPIGroupPtr(),
+							Kind:     "VirtualMachine",
+							Name:     vmName,
+						},
+						Source: filerestorev1alpha1.RestoreSource{
+							Snapshot: &filerestorev1alpha1.VolumeSnapshotSource{
+								Name: snapshotName,
+							},
 						},
 					},
-				},
-			}
-			err = env.CRClient.Create(context.Background(), manualRestore)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create manual restore CR")
+				}
+				err = env.CRClient.Create(context.Background(), manualRestore)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create manual restore CR")
 
-			By("waiting for VolumeReady phase")
-			restore := waitForRestorePhase(env.CRClient, env.Namespace, manualRestoreName,
-				filerestorev1alpha1.RestorePhaseVolumeReady)
-			mountPath := restore.Status.MountPath
-			Expect(mountPath).NotTo(BeEmpty(), "MountPath not set")
-			Expect(mountPath).To(Equal("/backup-"+snapshotName), "MountPath format incorrect")
+				By("waiting for VolumeReady phase")
+				restore := waitForRestorePhase(env.CRClient, env.Namespace, manualRestoreName,
+					filerestorev1alpha1.RestorePhaseVolumeReady)
+				mountPath := restore.Status.MountPath
+				Expect(mountPath).NotTo(BeEmpty(), "MountPath not set")
+				Expect(mountPath).To(Equal("/backup-"+snapshotName), "MountPath format incorrect")
 
-			By("verifying backup mount is read-only")
-			Eventually(func(g Gomega) {
-				mp := shellEscape(mountPath)
-				roCheck, err := runSSHCommand(vmName, env.Namespace,
-					fmt.Sprintf("findmnt -n -o OPTIONS %s || awk -v mp=%s '$2==mp{print $4}' /proc/mounts", mp, mp),
+				By("verifying backup mount is read-only")
+				Eventually(func(g Gomega) {
+					mp := shellEscape(mountPath)
+					roCheck, err := runSSHCommand(vmName, env.Namespace,
+						fmt.Sprintf("findmnt -n -o OPTIONS %s || awk -v mp=%s '$2==mp{print $4}' /proc/mounts", mp, mp),
+						env.PrivateKeyPath)
+					g.Expect(err).NotTo(HaveOccurred(), "Failed to inspect mount options")
+					firstOpt := strings.Split(strings.TrimSpace(roCheck), ",")[0]
+					g.Expect(firstOpt).To(Equal("ro"), "Expected first mount option to be ro, got %q", roCheck)
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying files are accessible from snapshot")
+				snapshotFilePath := mountPath + manualTestFile
+				Eventually(func(g Gomega) {
+					_, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -d %s", mountPath), env.PrivateKeyPath)
+					g.Expect(err).NotTo(HaveOccurred(), "Mount point does not exist")
+					_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -f %s", snapshotFilePath), env.PrivateKeyPath)
+					g.Expect(err).NotTo(HaveOccurred(), "File not accessible from snapshot mount")
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("copying a file from the read-only backup mount to /tmp")
+				_, err = runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("cp %s /tmp/manual-restore-copy.txt", shellEscape(snapshotFilePath)), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to copy file from read-only mount")
+
+				By("verifying file content from snapshot")
+				content, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("cat %s", snapshotFilePath), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to read file from snapshot")
+				Expect(content).To(ContainSubstring(testFileContent), "File content mismatch")
+
+				By("deleting VirtualMachineFileRestore CR to unplug volume")
+				err = env.CRClient.Delete(context.Background(), manualRestore)
+				Expect(err).NotTo(HaveOccurred(), "Failed to delete restore CR")
+
+				By("verifying hotplug volume is detached from VMI")
+				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, manualRestoreName)
+
+				By("verifying volume is unmounted or inaccessible in guest after CR deletion")
+				Eventually(func(g Gomega) {
+					_, err := runSSHCommand(vmName, env.Namespace,
+						fmt.Sprintf("! mountpoint -q %s", shellEscape(mountPath)), env.PrivateKeyPath)
+					g.Expect(err).NotTo(HaveOccurred(), "volume still mounted at %s after CR deletion", mountPath)
+				}, 30*time.Second, 5*time.Second).Should(Succeed())
+			})
+
+			/*
+				Restore status reports accurate file count.
+
+				Preconditions:
+					- Running Linux VM with guest helper and filerestore SSH user configured
+					- VolumeSnapshot of boot disk containing a directory with exactly 3 files
+
+				Steps:
+					1. Delete the directory from the live disk after snapshot (simulate data loss)
+					2. Create VirtualMachineFileRestore CR restoring the directory via automatic mode
+					3. Wait for Succeeded and read status.restoredFilesCount
+					4. Count restored files in the guest and compare to status
+
+				Expected: restoredFilesCount is 3 and matches files present in the VM
+			*/
+			It("should report file count matching the actual number of files transferred on a Linux VM", func() {
+				const (
+					fileCountSnap    = "fedora-file-count-snap"
+					fileCountRestore = "restore-file-count-linux"
+					fileCountDir     = "/home/donald/restore-count-data"
+					expectedFiles    = 3
+				)
+
+				env := sharedEnv
+				DeferCleanup(func() {
+					deleteSnapshotIfExists(env, fileCountSnap)
+					deleteFileRestoreIfExists(env, fileCountRestore)
+				})
+
+				By("creating test user and a directory tree with three files")
+				_, err := runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("id %s &>/dev/null || useradd -m -s /bin/bash %s", testUser, testUser), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
+				setupFilesCmd := fmt.Sprintf(
+					`su - %s -c 'mkdir -p %s/subdir && `+
+						`echo file1 > %s/file1.txt && `+
+						`echo file2 > %s/file2.txt && `+
+						`echo file3 > %s/subdir/file3.txt && sync'`,
+					testUser, fileCountDir,
+					fileCountDir, fileCountDir, fileCountDir,
+				)
+				_, err = runSSHCommand(vmName, env.Namespace, setupFilesCmd, env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test files")
+				_, err = runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("chown -R %s:%s %s", testUser, testUser, fileCountDir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to chown test files")
+				_, err = runSSHCommand(vmName, env.Namespace, "sync", env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to sync filesystem")
+				time.Sleep(3 * time.Second)
+
+				By("verifying test files exist before snapshot")
+				_, err = runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("test -f %s/file1.txt && test -f %s/file2.txt && test -f %s/subdir/file3.txt",
+						fileCountDir, fileCountDir, fileCountDir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Test files not present before snapshot")
+
+				By("creating VolumeSnapshot of boot disk")
+				err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, fileCountSnap)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create VolumeSnapshot")
+				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, fileCountSnap)
+
+				By("deleting the directory tree to verify restore")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -rf %s", fileCountDir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to delete directory tree")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", fileCountDir), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Directory tree was not deleted")
+
+				By("creating VirtualMachineFileRestore CR")
+				err = createFileRestoreCR(env.CRClient, env.Namespace, fileCountRestore, fileCountSnap, fileCountDir)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create restore CR")
+
+				By("waiting for restore to complete")
+				waitForRestorePhase(env.CRClient, env.Namespace, fileCountRestore,
+					filerestorev1alpha1.RestorePhaseSucceeded)
+
+				By("verifying restoredFilesCount in status")
+				restore := getFileRestore(env.CRClient, env.Namespace, fileCountRestore)
+				Expect(restore.Status.RestoredFilesCount).NotTo(BeNil(),
+					"restoredFilesCount should be set after automatic restore; redeploy the operator "+
+						"(make cluster-sync) so it includes PR #31 file-count parsing — e2e installs "+
+						"the current guest helper, which emits [filerestore] N files restored")
+				Expect(*restore.Status.RestoredFilesCount).To(Equal(int32(expectedFiles)),
+					"restoredFilesCount should match files transferred")
+
+				By("verifying restored files exist in the guest")
+				fileList, err := runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("find %s -type f | sort", shellEscape(fileCountDir)), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to list restored files")
+				restoredPaths := strings.Fields(strings.TrimSpace(fileList))
+				Expect(restoredPaths).To(HaveLen(expectedFiles))
+				Expect(restoredPaths).To(ConsistOf(
+					fileCountDir+"/file1.txt",
+					fileCountDir+"/file2.txt",
+					fileCountDir+"/subdir/file3.txt",
+				))
+			})
+
+			/*
+				[NEGATIVE] Volume attachment failure.
+
+				Preconditions:
+					- Running Linux VM with guest helper configured
+					- No PVC named in the restore CR exists in the namespace
+
+				Steps:
+					1. Create VirtualMachineFileRestore CR referencing a non-existent PVC
+					2. Wait for restore to reach Failed phase
+					3. Read status.errorMessage
+					4. Inspect VMI for orphaned backup volumes
+
+				Expected: Failed with message describing attachment/source failure; no orphaned volumes
+			*/
+			It("should report a clear error when volume attachment fails during restore", func() {
+				env := sharedEnv
+				restoreName := "restore-missing-pvc"
+				DeferCleanup(func() { deleteFileRestoreIfExists(env, restoreName) })
+
+				By("creating VirtualMachineFileRestore CR referencing a non-existent PVC")
+				err := createFileRestoreCRFromPVC(
+					env.CRClient, env.Namespace, restoreName, vmName, "does-not-exist-pvc", "/home/donald",
+				)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for Failed phase")
+				restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 3*time.Minute)
+				msg := strings.ToLower(restore.Status.ErrorMessage)
+				Expect(msg).To(And(
+					ContainSubstring("does-not-exist-pvc"),
+					ContainSubstring("not found"),
+				), "errorMessage should name the missing PVC: %s", restore.Status.ErrorMessage)
+
+				By("verifying no orphaned restore volume remains attached")
+				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, restoreName)
+			})
+
+			/*
+				[NEGATIVE] File transfer failure.
+
+				Preconditions:
+					- Running Linux VM with guest helper and filerestore SSH user configured
+					- Backup snapshot exists but does not contain the source path specified in the CR
+
+				Steps:
+					1. Create VirtualMachineFileRestore CR with a non-existent source path
+					2. Wait for restore to reach Failed phase
+					3. Read status.errorMessage
+					4. Verify no file was created at the target path
+					5. Verify hotplugged volume is detached after failure
+
+				Expected: Failed with transfer/path error; target unchanged; volume cleaned up
+			*/
+			It("should report a clear error when file transfer fails during restore", func() {
+				const (
+					xferSnap    = "fedora-xfer-fail-snap"
+					xferRestore = "restore-xfer-fail"
+					missingPath = "/home/donald/does-not-exist-on-backup"
+				)
+
+				env := sharedEnv
+				DeferCleanup(func() {
+					deleteSnapshotIfExists(env, xferSnap)
+					deleteFileRestoreIfExists(env, xferRestore)
+				})
+
+				By("creating VolumeSnapshot of a disk that lacks the restore source path")
+				err := createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, xferSnap)
+				Expect(err).NotTo(HaveOccurred())
+				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, xferSnap)
+
+				By("creating VirtualMachineFileRestore CR with non-existent sourcePath")
+				err = createFileRestoreCR(env.CRClient, env.Namespace, xferRestore, xferSnap, missingPath)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for Failed phase")
+				restore := waitForRestoreFailed(env.CRClient, env.Namespace, xferRestore, 5*time.Minute)
+				Expect(restore.Status.ErrorMessage).NotTo(BeEmpty())
+
+				By("verifying target path was not created")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", missingPath), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "unexpected path created after failed transfer")
+
+				By("verifying hotplugged volume is cleaned up")
+				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, xferRestore)
+				assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, xferRestore)
+			})
+
+			/*
+				Temporary resources cleaned up after successful restore.
+
+				Preconditions:
+					- Running Linux VM with guest helper and filerestore SSH user configured
+					- Backup snapshot with test file
+					- Baseline: restore will create a temporary DataVolume for the snapshot source
+
+				Steps:
+					1. Create VirtualMachineFileRestore CR in automatic mode
+					2. Wait for restore to reach Succeeded phase
+					3. Verify hotplugged backup volume is absent from VMI volumeStatus
+					4. Verify temporary restore DataVolume was removed
+					5. Verify restore CR remains with Succeeded status for audit
+
+				Expected: All temporary resources removed after completion; restore CR available for status inspection
+			*/
+			It("should automatically clean up all temporary resources after successful restore", func() {
+				const cleanupRestoreName = "restore-cleanup-test"
+
+				env := sharedEnv
+				DeferCleanup(func() {
+					deleteSnapshotIfExists(env, snapshotName)
+					deleteFileRestoreIfExists(env, cleanupRestoreName)
+				})
+
+				By("creating test user and file")
+				_, err := runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("id %s &>/dev/null || useradd -m -s /bin/bash %s", testUser, testUser), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
+				_, err = runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("su - %s -c 'echo cleanup-test > %s' && sync", testUser, testFilePath),
 					env.PrivateKeyPath)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to inspect mount options")
-				firstOpt := strings.Split(strings.TrimSpace(roCheck), ",")[0]
-				g.Expect(firstOpt).To(Equal("ro"), "Expected first mount option to be ro, got %q", roCheck)
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test file")
+				time.Sleep(2 * time.Second)
 
-			By("verifying files are accessible from snapshot")
-			snapshotFilePath := mountPath + manualTestFile
-			Eventually(func(g Gomega) {
-				_, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -d %s", mountPath), env.PrivateKeyPath)
-				g.Expect(err).NotTo(HaveOccurred(), "Mount point does not exist")
-				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test -f %s", snapshotFilePath), env.PrivateKeyPath)
-				g.Expect(err).NotTo(HaveOccurred(), "File not accessible from snapshot mount")
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+				By("creating VolumeSnapshot of boot disk")
+				err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapshotName)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create VolumeSnapshot")
+				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapshotName)
 
-			By("copying a file from the read-only backup mount to /tmp")
-			_, err = runSSHCommand(vmName, env.Namespace,
-				fmt.Sprintf("cp %s /tmp/manual-restore-copy.txt", shellEscape(snapshotFilePath)), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to copy file from read-only mount")
+				By("deleting the test file")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -f %s", testFilePath), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
 
-			By("verifying file content from snapshot")
-			content, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("cat %s", snapshotFilePath), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to read file from snapshot")
-			Expect(content).To(ContainSubstring(testFileContent), "File content mismatch")
+				By("creating VirtualMachineFileRestore CR")
+				err = createFileRestoreCR(
+					env.CRClient, env.Namespace, cleanupRestoreName, snapshotName, fmt.Sprintf("/home/%s", testUser),
+				)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create restore CR")
 
-			By("deleting VirtualMachineFileRestore CR to unplug volume")
-			err = env.CRClient.Delete(context.Background(), manualRestore)
-			Expect(err).NotTo(HaveOccurred(), "Failed to delete restore CR")
+				By("waiting for restore to complete")
+				waitForRestorePhase(env.CRClient, env.Namespace, cleanupRestoreName,
+					filerestorev1alpha1.RestorePhaseSucceeded)
 
-			By("verifying volume is unmounted after CR deletion")
-			Eventually(func(g Gomega) {
-				_, err := runSSHCommand(vmName, env.Namespace, fmt.Sprintf("mountpoint -q %s", mountPath), env.PrivateKeyPath)
-				g.Expect(err).To(HaveOccurred(), "Volume still mounted after CR deletion")
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying hotplug volume is detached from VMI")
-			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, manualRestoreName)
-		})
-
-		/*
-			Restore status reports accurate file count.
-
-			Preconditions:
-				- Running Linux VM with guest helper and filerestore SSH user configured
-				- VolumeSnapshot of boot disk containing a directory with exactly 3 files
-
-			Steps:
-				1. Delete the directory from the live disk after snapshot (simulate data loss)
-				2. Create VirtualMachineFileRestore CR restoring the directory via automatic mode
-				3. Wait for Succeeded and read status.restoredFilesCount
-				4. Count restored files in the guest and compare to status
-
-			Expected: restoredFilesCount is 3 and matches files present in the VM
-		*/
-		It("should report file count matching the actual number of files transferred on a Linux VM", func() {
-			const (
-				fileCountSnap    = "fedora-file-count-snap"
-				fileCountRestore = "restore-file-count-linux"
-				fileCountDir     = "/home/donald/restore-count-data"
-				expectedFiles    = 3
-			)
-
-			env := setupTestVM("e2e-file-count")
-
-			By("creating test user and a directory tree with three files")
-			_, err := runSSHCommand(vmName, env.Namespace,
-				fmt.Sprintf("useradd -m -s /bin/bash %s", testUser), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
-			setupFilesCmd := fmt.Sprintf(
-				`su - %s -c 'mkdir -p %s/subdir && `+
-					`echo file1 > %s/file1.txt && `+
-					`echo file2 > %s/file2.txt && `+
-					`echo file3 > %s/subdir/file3.txt && sync'`,
-				testUser, fileCountDir,
-				fileCountDir, fileCountDir, fileCountDir,
-			)
-			_, err = runSSHCommand(vmName, env.Namespace, setupFilesCmd, env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test files")
-			_, err = runSSHCommand(vmName, env.Namespace,
-				fmt.Sprintf("chown -R %s:%s %s", testUser, testUser, fileCountDir), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to chown test files")
-			time.Sleep(2 * time.Second)
-
-			By("creating VolumeSnapshot of boot disk")
-			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, fileCountSnap)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create VolumeSnapshot")
-			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, fileCountSnap)
-
-			By("deleting the directory tree to verify restore")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -rf %s", fileCountDir), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to delete directory tree")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", fileCountDir), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Directory tree was not deleted")
-
-			By("creating VirtualMachineFileRestore CR")
-			err = createFileRestoreCR(env.CRClient, env.Namespace, fileCountRestore, fileCountSnap, fileCountDir)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create restore CR")
-
-			By("waiting for restore to complete")
-			waitForRestorePhase(env.CRClient, env.Namespace, fileCountRestore,
-				filerestorev1alpha1.RestorePhaseSucceeded)
-
-			By("verifying restoredFilesCount in status")
-			restore := getFileRestore(env.CRClient, env.Namespace, fileCountRestore)
-			Expect(restore.Status.RestoredFilesCount).NotTo(BeNil(),
-				"restoredFilesCount should be set after automatic restore; redeploy the operator "+
-					"(make cluster-sync) so it includes PR #31 file-count parsing — e2e installs "+
-					"the current guest helper, which emits [filerestore] N files restored")
-			Expect(*restore.Status.RestoredFilesCount).To(Equal(int32(expectedFiles)),
-				"restoredFilesCount should match files transferred")
-
-			By("verifying restored files exist in the guest")
-			fileList, err := runSSHCommand(vmName, env.Namespace,
-				fmt.Sprintf("find %s -type f | sort", shellEscape(fileCountDir)), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to list restored files")
-			restoredPaths := strings.Fields(strings.TrimSpace(fileList))
-			Expect(restoredPaths).To(HaveLen(expectedFiles))
-			Expect(restoredPaths).To(ConsistOf(
-				fileCountDir+"/file1.txt",
-				fileCountDir+"/file2.txt",
-				fileCountDir+"/subdir/file3.txt",
-			))
-		})
-
-		/*
-			[NEGATIVE] Volume attachment failure.
-
-			Preconditions:
-				- Running Linux VM with guest helper configured
-				- No PVC named in the restore CR exists in the namespace
-
-			Steps:
-				1. Create VirtualMachineFileRestore CR referencing a non-existent PVC
-				2. Wait for restore to reach Failed phase
-				3. Read status.errorMessage
-				4. Inspect VMI for orphaned backup volumes
-
-			Expected: Failed with message describing attachment/source failure; no orphaned volumes
-		*/
-		It("should report a clear error when volume attachment fails during restore", func() {
-			env := setupTestVM("e2e-attach-fail")
-			restoreName := "restore-missing-pvc"
-
-			By("creating VirtualMachineFileRestore CR referencing a non-existent PVC")
-			err := createFileRestoreCRFromPVC(
-				env.CRClient, env.Namespace, restoreName, vmName, "does-not-exist-pvc", "/home/donald",
-			)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for Failed phase")
-			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 3*time.Minute)
-			msg := strings.ToLower(restore.Status.ErrorMessage)
-			Expect(msg).To(And(
-				ContainSubstring("does-not-exist-pvc"),
-				ContainSubstring("not found"),
-			), "errorMessage should name the missing PVC: %s", restore.Status.ErrorMessage)
-
-			By("verifying no orphaned restore volume remains attached")
-			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, restoreName)
-		})
+				assertSuccessfulRestoreCleanup(env.VirtClient, env.CRClient, env.Namespace, vmName, cleanupRestoreName, true)
+			})
+		}) // end Context("standard restore operations") — shared VM is torn down here before special-VM tests
 
 		/*
 			[NEGATIVE] Guest connection failure.
@@ -730,107 +874,6 @@ sync
 			By("verifying hotplugged volume is cleaned up")
 			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, sshFailRestore)
 			assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, sshFailRestore)
-		})
-
-		/*
-			[NEGATIVE] File transfer failure.
-
-			Preconditions:
-				- Running Linux VM with guest helper and filerestore SSH user configured
-				- Backup snapshot exists but does not contain the source path specified in the CR
-
-			Steps:
-				1. Create VirtualMachineFileRestore CR with a non-existent source path
-				2. Wait for restore to reach Failed phase
-				3. Read status.errorMessage
-				4. Verify no file was created at the target path
-				5. Verify hotplugged volume is detached after failure
-
-			Expected: Failed with transfer/path error; target unchanged; volume cleaned up
-		*/
-		It("should report a clear error when file transfer fails during restore", func() {
-			const (
-				xferSnap    = "fedora-xfer-fail-snap"
-				xferRestore = "restore-xfer-fail"
-				missingPath = "/home/donald/does-not-exist-on-backup"
-			)
-
-			env := setupTestVM("e2e-xfer-fail")
-
-			By("creating VolumeSnapshot of a disk that lacks the restore source path")
-			err := createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, xferSnap)
-			Expect(err).NotTo(HaveOccurred())
-			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, xferSnap)
-
-			By("creating VirtualMachineFileRestore CR with non-existent sourcePath")
-			err = createFileRestoreCR(env.CRClient, env.Namespace, xferRestore, xferSnap, missingPath)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for Failed phase")
-			restore := waitForRestoreFailed(env.CRClient, env.Namespace, xferRestore, 5*time.Minute)
-			Expect(restore.Status.ErrorMessage).NotTo(BeEmpty())
-
-			By("verifying target path was not created")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", missingPath), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "unexpected path created after failed transfer")
-
-			By("verifying hotplugged volume is cleaned up")
-			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, xferRestore)
-			assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, xferRestore)
-		})
-
-		/*
-			Temporary resources cleaned up after successful restore.
-
-			Preconditions:
-				- Running Linux VM with guest helper and filerestore SSH user configured
-				- Backup snapshot with test file
-				- Baseline: restore will create a temporary DataVolume for the snapshot source
-
-			Steps:
-				1. Create VirtualMachineFileRestore CR in automatic mode
-				2. Wait for restore to reach Succeeded phase
-				3. Verify hotplugged backup volume is absent from VMI volumeStatus
-				4. Verify temporary restore DataVolume was removed
-				5. Verify restore CR remains with Succeeded status for audit
-
-			Expected: All temporary resources removed after completion; restore CR available for status inspection
-		*/
-		It("should automatically clean up all temporary resources after successful restore", func() {
-			const cleanupRestoreName = "restore-cleanup-test"
-
-			env := setupTestVM("e2e-cleanup")
-
-			By("creating test user and file")
-			_, err := runSSHCommand(vmName, env.Namespace,
-				fmt.Sprintf("useradd -m -s /bin/bash %s", testUser), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test user")
-			_, err = runSSHCommand(vmName, env.Namespace,
-				fmt.Sprintf("su - %s -c 'echo cleanup-test > %s' && sync", testUser, testFilePath),
-				env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test file")
-			time.Sleep(2 * time.Second)
-
-			By("creating VolumeSnapshot of boot disk")
-			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapshotName)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create VolumeSnapshot")
-			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapshotName)
-
-			By("deleting the test file")
-			_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -f %s", testFilePath), env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("creating VirtualMachineFileRestore CR")
-			err = createFileRestoreCR(
-				env.CRClient, env.Namespace, cleanupRestoreName, snapshotName, fmt.Sprintf("/home/%s", testUser),
-			)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create restore CR")
-
-			By("waiting for restore to complete")
-			waitForRestorePhase(env.CRClient, env.Namespace, cleanupRestoreName,
-				filerestorev1alpha1.RestorePhaseSucceeded)
-
-			assertSuccessfulRestoreCleanup(env.VirtClient, env.CRClient, env.Namespace, vmName, cleanupRestoreName, true)
 		})
 
 		/*
