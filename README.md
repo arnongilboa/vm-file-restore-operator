@@ -94,50 +94,53 @@ kubectl apply -k config/samples/
 
 The operator requires SSH access to VMs to execute restore operations. The operator connects as user **`filerestore`** on both Linux and Windows VMs.
 
-### 1. Get the Operator's SSH Public Key
+The operator stores everything needed for VM setup in its ConfigMap (`vm-file-restore-operator-ssh`):
+- `data.ssh-publickey` — the operator's SSH public key
+- `binaryData.linux-helpers.tar` — uncompressed tar with `setup.sh` and `filerestore.sh`
+- `binaryData.windows-helpers.tar` — uncompressed tar with `setup.bat` and `filerestore.bat`
 
-After deploying the operator, retrieve the public key:
+### 1. Configure VMs with Setup Scripts
 
-```bash
-kubectl get configmap vm-file-restore-operator-ssh \
-  -n file-restore \
-  -o jsonpath='{.data.ssh-publickey}'
-```
-
-### 2. Configure VMs with Setup Scripts
-
-Use the automated setup scripts to configure VMs in one command:
+Extract the scripts from the ConfigMap and run them on the VM — no internet access required in the guest.
 
 **For Linux VMs:**
 ```bash
-# Get the operator's public key
 PUB_KEY=$(kubectl get configmap vm-file-restore-operator-ssh -n file-restore \
   -o jsonpath='{.data.ssh-publickey}')
 
-# Run setup script via virtctl ssh (as root)
-virtctl ssh root@vmi/fedora -c "curl -L https://raw.githubusercontent.com/kubevirt/vm-file-restore-operator/refs/heads/main/guest-helpers/linux/setup.sh | bash -s -- '$PUB_KEY'"
+mkdir -p /tmp/linux-helpers
+kubectl get configmap vm-file-restore-operator-ssh -n file-restore \
+  -o jsonpath="{.binaryData['linux-helpers\.tar']}" \
+  | base64 -d | tar -xf - -C /tmp/linux-helpers/
+
+virtctl scp --recursive /tmp/linux-helpers/ root@vmi/fedora:/tmp/
+virtctl ssh root@vmi/fedora -c "bash /tmp/linux-helpers/setup.sh '$PUB_KEY'"
 ```
 
 **For Windows VMs:**
 ```bash
-# Get the operator's public key
 PUB_KEY=$(kubectl get configmap vm-file-restore-operator-ssh -n file-restore \
   -o jsonpath='{.data.ssh-publickey}')
 
-# Run setup script via virtctl ssh (as Administrator)
-virtctl ssh Administrator@vmi/windows -c "curl -L https://raw.githubusercontent.com/kubevirt/vm-file-restore-operator/refs/heads/main/guest-helpers/windows/setup.bat -o %TEMP%\setup.bat && %TEMP%\setup.bat \"$PUB_KEY\""
+mkdir -p /tmp/win-helpers
+kubectl get configmap vm-file-restore-operator-ssh -n file-restore \
+  -o jsonpath="{.binaryData['windows-helpers\.tar']}" \
+  | base64 -d | tar -xf - -C /tmp/win-helpers/
+
+virtctl scp --recursive /tmp/win-helpers/ Administrator@vmi/win11:win-helpers
+virtctl ssh Administrator@vmi/win11 -c "win-helpers\setup.bat \"$PUB_KEY\""
 ```
 
 **What the setup scripts do:**
 - Create the `filerestore` user with appropriate permissions
 - Configure SSH key authentication (command-restricted for security)
 - Set up passwordless sudo (Linux only, restricted to restore script)
-- Download and install the helper script (`filerestore.sh` or `filerestore.bat`)
+- Install the helper script (`filerestore.sh` or `filerestore.bat`) from the same directory
 - Verify the installation
 
 **Manual setup:** If you prefer manual configuration or need to troubleshoot, see `guest-helpers/linux/setup.sh` and `guest-helpers/windows/setup.bat` for the detailed steps.
 
-### 3. Create a Restore
+### 2. Create a Restore
 
 Once SSH is configured and helpers are installed, create a restore:
 

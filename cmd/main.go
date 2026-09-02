@@ -249,19 +249,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	var keypairErr error
+	var ensureErr error
 	for i := 0; i < 5; i++ {
-		if err := controller.EnsureSSHKeypair(context.Background(), directClient, operatorNamespace); err != nil {
-			keypairErr = err
-			setupLog.Error(err, "Failed to ensure SSH keypair, retrying", "attempt", i+1)
+		if err := controller.EnsureOperatorResources(context.Background(), directClient, operatorNamespace); err != nil {
+			ensureErr = err
+			setupLog.Error(err, "Failed to ensure operator resources, retrying", "attempt", i+1)
 			time.Sleep(time.Duration(i+1) * time.Second)
 			continue
 		}
-		keypairErr = nil
+		ensureErr = nil
 		break
 	}
-	if keypairErr != nil {
-		setupLog.Error(keypairErr, "Failed to ensure SSH keypair after retries")
+	if ensureErr != nil {
+		setupLog.Error(ensureErr, "Failed to ensure operator resources after retries")
 		os.Exit(1)
 	}
 	setupLog.Info("SSH keypair ready")

@@ -17,49 +17,78 @@ limitations under the License.
 package e2e
 
 import (
+	"archive/tar"
+	"bytes"
 	"fmt"
+	"io"
 	"time"
-
-	linuxhelpers "kubevirt.io/vm-file-restore-operator/guest-helpers/linux"
 )
 
-// installGuestHelper stages the embedded filerestore.sh under a unique
-// root-private directory on the VM, then runs the embedded setup.sh with that
-// path so offline / QE installs do not use a shared /tmp location.
-func installGuestHelper(vmiName, namespace, operatorPubKey, identityFile string) error {
-	helperScript, err := linuxhelpers.FileRestoreScript()
+// installGuestHelper extracts setup.sh and filerestore.sh from linuxHelperTar,
+// stages each file on the VM via a single-quoted heredoc (avoids base64 overhead
+// and SSH exec-request size limits), then runs setup.sh with the operator's public key.
+func installGuestHelper(vmiName, namespace, operatorPubKey string, linuxHelperTar []byte, identityFile string) error {
+	scripts, err := extractTar(linuxHelperTar)
 	if err != nil {
-		return fmt.Errorf("read embedded filerestore.sh: %w", err)
+		return fmt.Errorf("extract linux-helpers.tar: %w", err)
 	}
-	setupScript, err := linuxhelpers.SetupScript()
-	if err != nil {
-		return fmt.Errorf("read embedded setup.sh: %w", err)
+
+	helperScript, ok := scripts["filerestore.sh"]
+	if !ok {
+		return fmt.Errorf("filerestore.sh not found in linux-helpers.tar")
+	}
+	setupScript, ok := scripts["setup.sh"]
+	if !ok {
+		return fmt.Errorf("setup.sh not found in linux-helpers.tar")
 	}
 
 	stageDir := fmt.Sprintf("/root/filerestore-helper-%d", time.Now().UnixNano())
-	stagedPath := stageDir + "/filerestore.sh"
-
-	// Paths are generated (no user input); heredoc body is literal via HELPER_EOF.
-	// chown/chmod run only if cat succeeds (&& after the redirection).
-	stageCmd := fmt.Sprintf(
-		"mkdir -m 0700 -p %s && cat <<'HELPER_EOF' > %s && chown root:root %s && chmod 0644 %s\n%s\nHELPER_EOF",
-		stageDir, stagedPath, stagedPath, stagedPath, helperScript,
-	)
-	if _, err := runSSHCommand(vmiName, namespace, stageCmd, identityFile); err != nil {
-		return fmt.Errorf("stage filerestore.sh on VM: %w", err)
-	}
-	// Remove staging dir on every exit path after a successful stage (setup may fail).
-	// Best-effort: don't mask a setup error with a flaky rm failure.
 	defer func() {
 		_, _ = runSSHCommand(vmiName, namespace, fmt.Sprintf("rm -rf %s", stageDir), identityFile)
 	}()
 
-	setupCmd := fmt.Sprintf(
-		"cat <<'SETUP_EOF' | bash -s -- %s %s\n%s\nSETUP_EOF",
-		shellEscape(operatorPubKey), shellEscape(stagedPath), setupScript,
-	)
-	if _, err := runSSHCommand(vmiName, namespace, setupCmd, identityFile); err != nil {
-		return fmt.Errorf("run guest setup.sh: %w", err)
+	// Stage both files individually to stay well under the SSH exec-request packet limit.
+	// Single-quoted heredoc (<<'STAGE_EOF') passes content literally without variable expansion.
+	for name, content := range map[string]string{"filerestore.sh": helperScript, "setup.sh": setupScript} {
+		path := stageDir + "/" + name
+		cmd := fmt.Sprintf(
+			"mkdir -m 0700 -p %s && cat <<'STAGE_EOF' > %s && chown root:root %s && chmod 0644 %s\n%s\nSTAGE_EOF",
+			stageDir, path, path, path, content,
+		)
+		if _, err := runSSHCommand(vmiName, namespace, cmd, identityFile); err != nil {
+			return fmt.Errorf("stage %s on VM: %w", name, err)
+		}
+	}
+
+	// Verify staged files are in place before running setup.
+	if lsOut, err := runSSHCommand(vmiName, namespace, fmt.Sprintf("ls -la %s/", stageDir), identityFile); err != nil {
+		return fmt.Errorf("staged files missing in %s: %w\n%s", stageDir, err, lsOut)
+	}
+
+	setupCmd := fmt.Sprintf("bash %s/setup.sh %s", stageDir, shellEscape(operatorPubKey))
+	if out, err := runSSHCommand(vmiName, namespace, setupCmd, identityFile); err != nil {
+		return fmt.Errorf("run guest setup.sh: %w\noutput:\n%s", err, out)
 	}
 	return nil
+}
+
+// extractTar reads an uncompressed tar archive and returns a map of filename -> content.
+func extractTar(data []byte) (map[string]string, error) {
+	files := make(map[string]string)
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		content, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", hdr.Name, err)
+		}
+		files[hdr.Name] = string(content)
+	}
+	return files, nil
 }

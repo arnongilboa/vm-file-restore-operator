@@ -6,13 +6,22 @@ metadata:
 rules:
 - apiGroups:
   - ""
+  resourceNames:
+  - vm-file-restore-operator-ssh
+  resources:
+  - configmaps
+  verbs:
+  - delete
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
   resources:
   - configmaps
   - secrets
   verbs:
   - create
-  - delete
-  - get
 - apiGroups:
   - ""
   resources:
@@ -31,6 +40,14 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resourceNames:
+  - vm-file-restore-operator-ssh
+  resources:
+  - secrets
+  verbs:
+  - get
 - apiGroups:
   - cdi.kubevirt.io
   resources:

@@ -2,7 +2,9 @@
 <#
 :BATCH
 copy /y "%~f0" "%TEMP%\setup.ps1" >nul
-powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\setup.ps1" %*
+set "_DIR=%~dp0"
+set "_DIR=%_DIR:~0,-1%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\setup.ps1" %* "%_DIR%"
 set _RC=%ERRORLEVEL%
 del /q "%TEMP%\setup.ps1" 2>nul
 exit /b %_RC%
@@ -16,7 +18,7 @@ exit /b %_RC%
 # This script:
 # - Creates the 'filerestore' user in Administrators group
 # - Configures SSH key authentication
-# - Downloads and installs the filerestore.bat helper script
+# - Installs the filerestore.bat helper script from the same directory as this script
 
 $ErrorActionPreference = 'Stop'
 
@@ -36,6 +38,11 @@ if ($args.Count -lt 1) {
 }
 
 $PubKey = $args[0]
+# $args[1] is the original script directory passed by the .bat wrapper (%~dp0, trailing \ stripped).
+# Use string concatenation instead of Join-Path to avoid drive-relative path issues when
+# the script runs from a drive root (e.g. C:\ → C: after stripping, and Join-Path C: foo
+# resolves against the current directory of C: rather than the root).
+$ScriptDir = if ($args.Count -ge 2) { $args[1].TrimEnd('\') + '\' } else { $PSScriptRoot + '\' }
 
 # Validate public key format
 if (-not $PubKey.StartsWith("ssh-")) {
@@ -77,35 +84,27 @@ if (-not (Test-Path $sshDir)) {
     New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
 }
 
-# Check if key already exists
-$keyExists = $false
+# Remove any existing entries for this key (restricted or unrestricted) before adding
+# the command-restricted form. An unrestricted entry would allow arbitrary SSH commands,
+# bypassing the intended restriction.
+$RestrictedKey = 'command="C:\Program Files\filerestore\filerestore.bat" ' + $PubKey
 if (Test-Path $AuthKeysPath) {
     $existingKeys = Get-Content -Path $AuthKeysPath -ErrorAction SilentlyContinue
-    if ($existingKeys -contains $PubKey) {
-        $keyExists = $true
-        Write-Host "  Key already exists, skipping"
+    if ($existingKeys) {
+        $filteredKeys = $existingKeys | Where-Object { $_ -notlike "*$PubKey*" }
+        Set-Content -Path $AuthKeysPath -Value $filteredKeys -Encoding ASCII
     }
+    Add-Content -Path $AuthKeysPath -Value $RestrictedKey -Encoding ASCII
+    Write-Host "  Key added/updated in authorized_keys (command-restricted)"
+} else {
+    Set-Content -Path $AuthKeysPath -Value $RestrictedKey -Encoding ASCII
+    Write-Host "  Key installed in new authorized_keys (command-restricted)"
 }
 
-# Add public key if it doesn't exist (with command restriction)
-if (-not $keyExists) {
-    $RestrictedKey = 'command="C:\Program Files\filerestore\filerestore.bat" ' + $PubKey
-
-    if (Test-Path $AuthKeysPath) {
-        # Append to existing file
-        Add-Content -Path $AuthKeysPath -Value $RestrictedKey -Encoding ASCII
-        Write-Host "  Key added to existing authorized_keys (command-restricted)"
-    } else {
-        # Create new file
-        Set-Content -Path $AuthKeysPath -Value $RestrictedKey -Encoding ASCII
-        Write-Host "  Key installed in new authorized_keys (command-restricted)"
-    }
-
-    # Set correct permissions (only SYSTEM and Administrators)
-    icacls $AuthKeysPath /inheritance:r | Out-Null
-    icacls $AuthKeysPath /grant "SYSTEM:F" | Out-Null
-    icacls $AuthKeysPath /grant "Administrators:F" | Out-Null
-}
+# Set correct permissions (only SYSTEM and Administrators)
+icacls $AuthKeysPath /inheritance:r | Out-Null
+icacls $AuthKeysPath /grant "SYSTEM:F" | Out-Null
+icacls $AuthKeysPath /grant "Administrators:F" | Out-Null
 
 Write-Host "  Key: $($PubKey.Substring(0, [Math]::Min(30, $PubKey.Length)))..."
 
@@ -118,16 +117,17 @@ if (Test-Path $sshdConfigPath) {
     $config = Get-Content $sshdConfigPath
     $modified = $false
 
-    if ($config -notmatch "^PubkeyAuthentication\s+yes") {
+    # Join array to string for boolean -match tests; -match on an array is a filter, not a boolean.
+    if (($config -join "`n") -notmatch "(?m)^PubkeyAuthentication\s+yes") {
         $config = $config -replace '#\s*PubkeyAuthentication.*','PubkeyAuthentication yes'
         $modified = $true
     }
 
-    if ($config -notmatch "^PasswordAuthentication\s+no") {
+    if (($config -join "`n") -notmatch "(?m)^PasswordAuthentication\s+no") {
         $config = $config -replace '#\s*PasswordAuthentication.*','PasswordAuthentication no'
-        if ($config -notmatch "^PasswordAuthentication\s+no") {
+        if (($config -join "`n") -notmatch "(?m)^PasswordAuthentication\s+no") {
             # Line didn't exist, add it
-            $config += "`nPasswordAuthentication no"
+            $config += "PasswordAuthentication no"
         }
         $modified = $true
     }
@@ -157,26 +157,23 @@ try {
     Write-Host "  WARNING: Could not configure SSH service: $_"
 }
 
-# Download and install helper script
+# Install helper script from the same directory as this script
 Write-Host "Installing filerestore.bat helper script..."
-$scriptUrl = "https://raw.githubusercontent.com/kubevirt/vm-file-restore-operator/refs/heads/main/guest-helpers/windows/filerestore.bat"
+$stagedHelper = "${ScriptDir}filerestore.bat"
 $scriptPath = "C:\Program Files\filerestore\filerestore.bat"
 
-# Create directory
+if (-not (Test-Path $stagedHelper)) {
+    Write-Host "ERROR: filerestore.bat not found next to setup.bat: $stagedHelper"
+    exit 1
+}
+
 $scriptDir = Split-Path $scriptPath
 if (-not (Test-Path $scriptDir)) {
     New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
 }
 
-# Download script
-try {
-    Invoke-WebRequest -Uri $scriptUrl -OutFile $scriptPath -UseBasicParsing
-    Write-Host "  Installed: $scriptPath"
-} catch {
-    Write-Host "ERROR: Failed to download helper script: $_"
-    Write-Host "Please manually download from: $scriptUrl"
-    exit 1
-}
+Copy-Item -Path $stagedHelper -Destination $scriptPath -Force
+Write-Host "  Installed: $scriptPath"
 
 # Verify installation
 Write-Host ""

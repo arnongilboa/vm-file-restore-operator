@@ -19,6 +19,7 @@ COPY api/ api/
 COPY internal/ internal/
 COPY pkg/ pkg/
 COPY tools/ tools/
+COPY guest-helpers/ guest-helpers/
 
 # Build
 # the GOARCH has not a default value to allow the binary be built according to the host where the command

@@ -57,8 +57,10 @@ type VirtualMachineFileRestoreReconciler struct {
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents,verbs=get
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=create
+// +kubebuilder:rbac:groups="",resources=secrets,resourceNames=vm-file-restore-operator-ssh,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create
+// +kubebuilder:rbac:groups="",resources=configmaps,resourceNames=vm-file-restore-operator-ssh,verbs=get;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 
@@ -231,7 +233,7 @@ func (r *VirtualMachineFileRestoreReconciler) getOperatorNamespace() string {
 func (r *VirtualMachineFileRestoreReconciler) getSSHPrivateKey(ctx context.Context) ([]byte, error) {
 	secret := &corev1.Secret{}
 	key := client.ObjectKey{
-		Name:      SSHKeypairSecretName,
+		Name:      OperatorResourceName,
 		Namespace: r.getOperatorNamespace(),
 	}
 	if err := r.APIReader.Get(ctx, key, secret); err != nil {

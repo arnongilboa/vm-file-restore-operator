@@ -14,6 +14,14 @@ metadata:
   name: virtualmachinefilerestore-admin-role
 rules:
 - apiGroups:
+  - ""
+  resourceNames:
+  - vm-file-restore-operator-ssh
+  resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups:
   - filerestore.kubevirt.io
   resources:
   - virtualmachinefilerestores
