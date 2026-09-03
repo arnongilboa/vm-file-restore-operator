@@ -894,3 +894,59 @@ type tokenRequest struct {
 		Token string `json:"token"`
 	} `json:"status"`
 }
+
+// deleteSnapshotIfExists deletes a VolumeSnapshot and waits until it is fully removed.
+func deleteSnapshotIfExists(env *TestEnv, name string) {
+	err := env.SnapshotClient.SnapshotV1().VolumeSnapshots(env.Namespace).Delete(
+		context.Background(), name, metav1.DeleteOptions{},
+	)
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "failed to delete VolumeSnapshot %s/%s", env.Namespace, name)
+	gomega.Eventually(func(g gomega.Gomega) {
+		_, err := env.SnapshotClient.SnapshotV1().VolumeSnapshots(env.Namespace).Get(
+			context.Background(), name, metav1.GetOptions{},
+		)
+		g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
+	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+}
+
+// deleteDVIfExists deletes a DataVolume and waits until it is fully removed.
+func deleteDVIfExists(env *TestEnv, name string) {
+	err := env.CRClient.Delete(context.Background(), &cdiv1beta1.DataVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+	})
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "failed to delete DataVolume %s/%s", env.Namespace, name)
+	gomega.Eventually(func(g gomega.Gomega) {
+		err := env.CRClient.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: name},
+			&cdiv1beta1.DataVolume{})
+		g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
+	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+}
+
+// deleteFileRestoreIfExists deletes a VirtualMachineFileRestore CR and waits for the operator
+// finalizer to complete and the hotplugged volume to be detached from the shared VM.
+func deleteFileRestoreIfExists(env *TestEnv, name string) {
+	err := env.CRClient.Delete(context.Background(), &filerestorev1alpha1.VirtualMachineFileRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+	})
+	if apierrors.IsNotFound(err) {
+		assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, name)
+		return
+	}
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "failed to delete VirtualMachineFileRestore %s/%s", env.Namespace,
+		name)
+	// Wait for the finalizer to run and the CR to be fully removed.
+	gomega.Eventually(func(g gomega.Gomega) {
+		current := &filerestorev1alpha1.VirtualMachineFileRestore{}
+		err := env.CRClient.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: name}, current)
+		g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "VirtualMachineFileRestore %s/%s still exists", env.Namespace,
+			name)
+	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+	// Ensure the hotplugged volume is detached before the next test runs on the shared VM.
+	assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, name)
+}
