@@ -260,9 +260,9 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 
 				env := sharedEnv
 				DeferCleanup(func() {
-					deleteSnapshotIfExists(env, pvcSnapName)
-					deleteDVIfExists(env, backupPVCName)
 					deleteFileRestoreIfExists(env, pvcRestoreName)
+					deleteDVIfExists(env, backupPVCName)
+					deleteSnapshotIfExists(env, pvcSnapName)
 				})
 
 				By("creating test user")
@@ -361,8 +361,8 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 
 				env := sharedEnv
 				DeferCleanup(func() {
-					deleteSnapshotIfExists(env, snapshotName)
 					deleteFileRestoreIfExists(env, restoreCRName)
+					deleteSnapshotIfExists(env, snapshotName)
 				})
 
 				By("creating test user")
@@ -465,8 +465,8 @@ sync
 			It("should make backup available read-only in guest when manual restore", func() {
 				env := sharedEnv
 				DeferCleanup(func() {
-					deleteSnapshotIfExists(env, snapshotName)
 					deleteFileRestoreIfExists(env, "manual-restore-test")
+					deleteSnapshotIfExists(env, snapshotName)
 				})
 
 				By(fmt.Sprintf("creating test user %s", testUser))
@@ -568,7 +568,7 @@ sync
 				By("verifying hotplug volume is detached from VMI")
 				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, manualRestoreName)
 
-				By("verifying volume is unmounted or inaccessible in guest after CR deletion")
+				By("verifying volume is unmounted after CR deletion")
 				Eventually(func(g Gomega) {
 					_, err := runSSHCommand(vmName, env.Namespace,
 						fmt.Sprintf("! mountpoint -q %s", shellEscape(mountPath)), env.PrivateKeyPath)
@@ -601,8 +601,8 @@ sync
 
 				env := sharedEnv
 				DeferCleanup(func() {
-					deleteSnapshotIfExists(env, fileCountSnap)
 					deleteFileRestoreIfExists(env, fileCountRestore)
+					deleteSnapshotIfExists(env, fileCountSnap)
 				})
 
 				By("creating test user and a directory tree with three files")
@@ -736,8 +736,8 @@ sync
 
 				env := sharedEnv
 				DeferCleanup(func() {
-					deleteSnapshotIfExists(env, xferSnap)
 					deleteFileRestoreIfExists(env, xferRestore)
+					deleteSnapshotIfExists(env, xferSnap)
 				})
 
 				By("creating VolumeSnapshot of a disk that lacks the restore source path")
@@ -784,8 +784,8 @@ sync
 
 				env := sharedEnv
 				DeferCleanup(func() {
-					deleteSnapshotIfExists(env, snapshotName)
 					deleteFileRestoreIfExists(env, cleanupRestoreName)
+					deleteSnapshotIfExists(env, snapshotName)
 				})
 
 				By("creating test user and file")
