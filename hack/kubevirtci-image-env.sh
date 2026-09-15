@@ -15,7 +15,9 @@ export KUBEVIRTCI_CONFIG_PATH="${KUBEVIRTCI_CONFIG_PATH:-${REPO_ROOT}/kubevirtci
 
 provider_config="${KUBEVIRTCI_CONFIG_PATH}/${KUBEVIRT_PROVIDER}/config-provider-${KUBEVIRT_PROVIDER}.sh"
 if [ ! -f "${provider_config}" ]; then
-	if [ -n "${IMG:-}" ] && [ -n "${PUSH_IMG:-}" ]; then
+	if [ -n "${IMG:-}" ] || [ -n "${PUSH_IMG:-}" ]; then
+		[ -z "${PUSH_IMG:-}" ] && export PUSH_IMG="${IMG}"
+		[ -z "${IMG:-}" ] && export IMG="${PUSH_IMG}"
 		return 0 2>/dev/null || exit 0
 	fi
 	echo "Error: ${provider_config} not found. Run 'make cluster-up' before cluster-sync." >&2
@@ -28,11 +30,13 @@ source "${KUBEVIRTCI_PATH%/}/hack/config.sh"
 image_name="vm-file-restore-operator"
 image_tag="${IMAGE_TAG:-dev-$(git -C "${REPO_ROOT}" rev-parse --short HEAD)}"
 
-if [ -z "${PUSH_IMG:-}" ]; then
+if [ -z "${PUSH_IMG:-}" ] && [ -z "${IMG:-}" ]; then
 	export PUSH_IMG="${docker_prefix}/${image_name}:${image_tag}"
-fi
-if [ -z "${IMG:-}" ]; then
 	export IMG="${manifest_docker_prefix}/${image_name}:${image_tag}"
+elif [ -z "${PUSH_IMG:-}" ]; then
+	export PUSH_IMG="${IMG}"
+elif [ -z "${IMG:-}" ]; then
+	export IMG="${PUSH_IMG}"
 fi
 
 echo "Using PUSH_IMG=${PUSH_IMG}" >&2

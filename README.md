@@ -392,11 +392,12 @@ The host and in-cluster URLs differ because kubevirtci exposes the registry on
 are read from `kubevirtci/_ci-configs/<provider>/config-provider-*.sh` after
 `cluster-up`; see `hack/kubevirtci-image-env.sh`.
 
-Set both explicitly to use an external registry instead:
+Set both to the same registry when pushing and pulling from outside kubevirtci
+(the host and cluster use the same URL):
 
 ```bash
 PUSH_IMG=registry.example.com/kubevirt/vm-file-restore-operator:example-tag \
-IMG=registry:5000/kubevirt/vm-file-restore-operator:example-tag \
+IMG=registry.example.com/kubevirt/vm-file-restore-operator:example-tag \
 make cluster-sync
 ```
 
