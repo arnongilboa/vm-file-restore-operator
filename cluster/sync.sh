@@ -29,6 +29,13 @@ if [ "${SKIP_IMAGE_BUILD:-}" = "true" ]; then
     make build-installer IMG="${IMG}"
 else
     echo "Building and pushing operator image..."
+    # kubevirtci registry is HTTP-only. podman needs --tls-verify=false; docker does not.
+    if [[ "${PUSH_IMG}" == localhost* ]]; then
+        container_tool="${CONTAINER_TOOL:-docker}"
+        if "${container_tool}" push --help 2>&1 | grep -q -- '--tls-verify'; then
+            export CONTAINER_PUSH_FLAGS="${CONTAINER_PUSH_FLAGS:-"--tls-verify=false"}"
+        fi
+    fi
     make docker-build docker-push IMG="${PUSH_IMG}"
     make build-installer IMG="${IMG}"
 fi

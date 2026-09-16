@@ -76,6 +76,8 @@ endif
 # scaffolded by default. However, you might want to replace it to use other
 # tools. (i.e. podman)
 CONTAINER_TOOL ?= docker
+# Extra flags for $(CONTAINER_TOOL) push (e.g. --tls-verify=false for kubevirtci localhost registry when using podman).
+CONTAINER_PUSH_FLAGS ?=
 
 # GOOS and GOARCH define the target OS and architecture for builds.
 # Can be overridden via environment variables (e.g., GOARCH=arm64 make docker-build)
@@ -247,7 +249,7 @@ docker-build: ## Build docker image with the manager.
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
-	$(CONTAINER_TOOL) push ${IMG}
+	$(CONTAINER_TOOL) push $(CONTAINER_PUSH_FLAGS) ${IMG}
 
 .PHONY: buildah-image
 buildah-image: ## Build the image with the manager using buildah.
