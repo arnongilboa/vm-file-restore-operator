@@ -22,9 +22,6 @@ export KUBEVIRT_DEPLOY_CDI=true
 # Deploy rook-ceph for snapshot-capable storage (required for VolumeSnapshot support)
 export KUBEVIRT_STORAGE="${KUBEVIRT_STORAGE:-rook-ceph-default}"
 
-# KubeVirt version to deploy (can be overridden via KUBEVIRT_VERSION env var)
-# Pinned to a known-good version for reproducibility
-KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.8.4}"
 KUBEVIRT_WAIT_TIMEOUT="${KUBEVIRT_WAIT_TIMEOUT:-10m}"
 echo "Using KubeVirt version: ${KUBEVIRT_VERSION}"
 

@@ -18,3 +18,6 @@ export KUBEVIRTCI_TAG="${KUBEVIRTCI_TAG:-2606221522-c3d11ec0}"
 
 # Path to kubevirtci cluster-up scripts
 export KUBEVIRTCI_PATH="${REPO_ROOT}/kubevirtci/cluster-up/"
+
+# KubeVirt version deployed by hack/cluster-up.sh (virtctl must match).
+export KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.8.4}"

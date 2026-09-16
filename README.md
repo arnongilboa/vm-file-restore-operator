@@ -359,9 +359,11 @@ make test
 
 ### E2E Tests
 
-E2e tests exercise the operator against a real KubeVirt cluster created by
+E2E tests exercise the operator against a real KubeVirt cluster created by
 [kubevirtci](https://github.com/kubevirt/kubevirtci). They require a running
-cluster, a deployed operator, and `virtctl` on `PATH`.
+cluster, a deployed operator, and `virtctl` on `PATH` (guest verification uses
+`virtctl ssh`). `hack/test-e2e.sh` installs `virtctl` from the KubeVirt release
+matching `KUBEVIRT_VERSION` when it is not already available.
 
 #### Make targets
 
@@ -378,7 +380,7 @@ Run `make help` for the full target list.
 
 #### Operator image during e2e
 
-E2e does **not** deploy a pre-built image from Quay. `cluster-sync` builds the
+E2E does **not** deploy a pre-built image from Quay. `cluster-sync` builds the
 operator from the current working tree, tags it with the current git commit
 (`dev-<short-sha>` by default), and uses kubevirtci's embedded registry:
 
@@ -413,9 +415,10 @@ Equivalent to:
 ./hack/test-e2e.sh
 ```
 
-Requires `docker`, `kubectl`, `virtctl`, and sufficient resources for a
-2-node cluster with rook-ceph storage (defaults match the prow job:
-`KUBEVIRT_NUM_NODES=2`, `KUBEVIRT_STORAGE=rook-ceph-default`).
+Requires `docker` (or `podman`), `kubectl`, and sufficient resources for a
+2-node cluster with rook-ceph storage. `virtctl` is installed automatically by
+`hack/test-e2e.sh` if missing. Defaults match the prow job (`KUBEVIRT_NUM_NODES=2`,
+`KUBEVIRT_STORAGE=rook-ceph-default`).
 
 #### Run step-by-step (iteration)
 
@@ -430,6 +433,8 @@ export KUBECONFIG="${kubeconfig}"
 kubectl get nodes
 
 make cluster-sync
+
+source hack/install-virtctl.sh   # skip if virtctl is already on PATH
 make test-e2e
 ```
 
@@ -452,7 +457,10 @@ Default test timeout is `90m` (`E2E_TIMEOUT`).
 #### CI
 
 Prow job `pull-vm-file-restore-operator-e2e` runs `./hack/test-e2e.sh` on bare-metal
-workers. The job is optional and not run on every PR; trigger it with:
+workers (`quay.io/kubevirtci/golang`). The image does not include `virtctl`; the
+script downloads the `linux/amd64` release binary at runtime (prow and kubevirtci
+e2e target). Install `virtctl` yourself on other platforms. The job is optional
+and not run on every PR; trigger it with:
 
 ```text
 /test pull-vm-file-restore-operator-e2e
@@ -461,7 +469,7 @@ workers. The job is optional and not run on every PR; trigger it with:
 #### Cluster options
 
 ```bash
-KUBEVIRT_VERSION=v1.9.0 make cluster-up          # KubeVirt release (default: v1.8.4)
+KUBEVIRT_VERSION=v1.9.0 make cluster-up          # cluster + virtctl version (default: v1.8.4)
 KUBEVIRTCI_TAG=<tag> make cluster-up             # kubevirtci gocli version
 KUBEVIRT_PROVIDER=k8s-1.37 make cluster-up       # Kubernetes version (default: k8s-1.36)
 KUBEVIRT_NUM_NODES=3 make cluster-up             # cluster size (default: 2)

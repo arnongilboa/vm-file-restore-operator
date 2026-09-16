@@ -22,4 +22,7 @@ export KUBECONFIG="${kubeconfig}"
 source "${script_dir}/kubevirtci-image-env.sh"
 
 make cluster-sync
+
+# shellcheck source=install-virtctl.sh
+source "${script_dir}/install-virtctl.sh"
 make test-e2e
