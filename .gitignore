@@ -1,3 +1,6 @@
+# Local tooling
+.local/
+
 # Binaries for programs and plugins
 *.exe
 *.exe~
