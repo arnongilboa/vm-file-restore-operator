@@ -1120,15 +1120,36 @@ umount /mnt/lvmdata
 						fmt.Sprintf("echo '%s' > %s && sync", testContent, shellEscape(dataFileOnDisk)), env.PrivateKeyPath)
 					Expect(err).NotTo(HaveOccurred())
 
-					By("unmounting the data disk before taking its snapshot")
-					_, err = runSSHCommand(vmName, env.Namespace,
-						fmt.Sprintf("sync && umount %s", shellEscape(mountPoint)), env.PrivateKeyPath)
-					Expect(err).NotTo(HaveOccurred())
+					xfsFrozen := fstype == "xfs"
+					if xfsFrozen {
+						By("freezing the mounted XFS filesystem for snapshot creation")
+						_, err = runSSHCommand(vmName, env.Namespace,
+							fmt.Sprintf("sync && xfs_freeze -f %s", shellEscape(mountPoint)), env.PrivateKeyPath)
+						Expect(err).NotTo(HaveOccurred(), "failed to freeze XFS filesystem")
+						defer func() {
+							if xfsFrozen {
+								_, thawErr := runSSHCommand(vmName, env.Namespace,
+									fmt.Sprintf("xfs_freeze -u %s", shellEscape(mountPoint)), env.PrivateKeyPath)
+								Expect(thawErr).NotTo(HaveOccurred(), "failed to thaw XFS filesystem")
+							}
+						}()
+					}
 
 					By("creating the backup snapshot")
 					err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, dataDiskName, snapName)
 					Expect(err).NotTo(HaveOccurred())
 					waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapName)
+					if xfsFrozen {
+						_, err = runSSHCommand(vmName, env.Namespace,
+							fmt.Sprintf("xfs_freeze -u %s", shellEscape(mountPoint)), env.PrivateKeyPath)
+						Expect(err).NotTo(HaveOccurred(), "failed to thaw XFS filesystem")
+						xfsFrozen = false
+					}
+
+					By("removing the live file so restore must recreate it")
+					_, err = runSSHCommand(vmName, env.Namespace,
+						fmt.Sprintf("rm -f %s && sync", shellEscape(dataFileOnDisk)), env.PrivateKeyPath)
+					Expect(err).NotTo(HaveOccurred())
 
 					By("creating the restore CR")
 					err = createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, diskRelativePath)
