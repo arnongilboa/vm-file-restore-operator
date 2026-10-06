@@ -19,6 +19,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -694,7 +695,7 @@ func waitForRestorePhase(
 	return restore
 }
 
-// waitForRestoreFailed waits until the restore CR reaches Failed with a non-empty error message.
+// waitForRestoreFailed waits until the restore CR reaches Failed with non-empty failure details.
 func waitForRestoreFailed(
 	crClient client.Client, ns, name string, timeout time.Duration,
 ) *filerestorev1alpha1.VirtualMachineFileRestore {
@@ -708,7 +709,7 @@ func waitForRestoreFailed(
 		}
 		g.Expect(restore.Status.Phase).To(gomega.Equal(filerestorev1alpha1.RestorePhaseFailed),
 			fmt.Sprintf("Restore phase is %s", restore.Status.Phase))
-		g.Expect(restore.Status.ErrorMessage).NotTo(gomega.BeEmpty(), "Expected non-empty errorMessage")
+		g.Expect(restoreFailureText(restore)).NotTo(gomega.BeEmpty(), "Expected non-empty failure details")
 	}, timeout, 10*time.Second).Should(gomega.Succeed())
 	return restore
 }
@@ -722,6 +723,9 @@ func restoreVolumeName(restoreCRName string) string {
 func vmiHasRestoreVolume(virtClient kubecli.KubevirtClient, namespace, vmiName, restoreCRName string) (bool, error) {
 	vmi, err := virtClient.VirtualMachineInstance(namespace).Get(context.Background(), vmiName, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	want := restoreVolumeName(restoreCRName)
@@ -951,6 +955,358 @@ func deleteFileRestoreIfExists(env *TestEnv, name string) {
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
 	// Ensure the hotplugged volume is detached before the next test runs on the shared VM.
 	assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, name)
+}
+
+const dummySSHPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG1vY2tlZGtleWZvcnRlc3Rzbm90b3BlcmF0b3I=" +
+	" vmfr-e2e-dummy-key"
+
+func ensureRestoreTestUser(env *TestEnv) {
+	_, err := runSSHCommand(vmName, env.Namespace,
+		fmt.Sprintf("id %s &>/dev/null || useradd -m -s /bin/bash %s", testUser, testUser), env.PrivateKeyPath)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to ensure restore test user on guest")
+}
+
+func waitForGuestFile(env *TestEnv, filePath string) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		_, err := runSSHCommand(vmName, env.Namespace,
+			fmt.Sprintf("test -f %s", shellEscape(filePath)), env.PrivateKeyPath)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "file %s not visible on guest yet", filePath)
+	}, 30*time.Second, 2*time.Second).Should(gomega.Succeed())
+}
+
+func snapshotBootDisk(env *TestEnv, snapName string) {
+	err := createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapName)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create boot disk VolumeSnapshot")
+	waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapName)
+}
+
+func assertErrorMessageContains(restore *filerestorev1alpha1.VirtualMachineFileRestore, substrings ...string) {
+	msg := restoreFailureText(restore)
+	gomega.Expect(msg).NotTo(gomega.BeEmpty(), "expected non-empty restore failure details")
+	for _, want := range substrings {
+		gomega.Expect(msg).To(gomega.ContainSubstring(strings.ToLower(want)),
+			"restore failure details should contain %q (errorMessage=%q)", want, restore.Status.ErrorMessage)
+	}
+}
+
+func restoreFailureText(restore *filerestorev1alpha1.VirtualMachineFileRestore) string {
+	var parts []string
+	if restore.Status.ErrorMessage != "" {
+		parts = append(parts, strings.ToLower(restore.Status.ErrorMessage))
+	}
+	for _, condition := range restore.Status.Conditions {
+		if condition.Message != "" {
+			parts = append(parts, strings.ToLower(condition.Message))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func getOperatorSSHResources(k8sClient *kubernetes.Clientset) (string, []byte) {
+	configMap, err := k8sClient.CoreV1().ConfigMaps(operatorNamespace()).Get(
+		context.Background(), operatorSSHConfigMapName(), metav1.GetOptions{},
+	)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get operator SSH ConfigMap")
+	publicKey := strings.TrimSpace(configMap.Data["ssh-publickey"])
+	gomega.Expect(publicKey).NotTo(gomega.BeEmpty(), "Operator SSH public key is empty")
+	linuxTar := configMap.BinaryData["linux-helpers.tar"]
+	gomega.Expect(linuxTar).NotTo(gomega.BeEmpty(), "linux-helpers.tar not found in operator ConfigMap")
+	return publicKey, linuxTar
+}
+
+func installGuestHelperWithoutOperatorKey(env *TestEnv) {
+	_, linuxTar := getOperatorSSHResources(env.K8sClient)
+	gomega.Eventually(func(g gomega.Gomega) {
+		err := installGuestHelper(vmName, env.Namespace, dummySSHPublicKey, linuxTar, env.PrivateKeyPath)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Guest helper installation failed")
+	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed())
+}
+
+func removeFilerestoreHelperBinary(env *TestEnv) {
+	_, err := runSSHCommand(vmName, env.Namespace, "rm -f /usr/local/bin/filerestore.sh", env.PrivateKeyPath)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to remove filerestore.sh")
+}
+
+func stopVM(virtClient kubecli.KubevirtClient, namespace, name string) {
+	halted := kubevirtv1.RunStrategyHalted
+	patch := fmt.Appendf(nil, `{"spec":{"runStrategy":"%s"}}`, halted)
+	_, err := virtClient.VirtualMachine(namespace).Patch(
+		context.Background(), name, "application/merge-patch+json", patch, metav1.PatchOptions{},
+	)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to halt VM")
+	gomega.Eventually(func(g gomega.Gomega) {
+		_, err := virtClient.VirtualMachineInstance(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "VMI still exists after halt")
+	}, 5*time.Minute, 10*time.Second).Should(gomega.Succeed())
+}
+
+func interruptGuestRestoreWhileRunning(
+	crClient client.WithWatch, namespace, restoreName string,
+	timeout time.Duration,
+	action func() error,
+) <-chan error {
+	result := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	stream, err := crClient.Watch(ctx, &filerestorev1alpha1.VirtualMachineFileRestoreList{},
+		client.InNamespace(namespace), client.MatchingFields{"metadata.name": restoreName})
+	if err != nil {
+		cancel()
+		result <- fmt.Errorf("watch restore %s: %w", restoreName, err)
+		close(result)
+		return result
+	}
+
+	go func() {
+		defer close(result)
+		defer cancel()
+		defer stream.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				result <- fmt.Errorf("restore did not reach Restoring within %s", timeout)
+				return
+			case event, ok := <-stream.ResultChan():
+				if !ok {
+					result <- fmt.Errorf("restore watch closed before %s reached Restoring", restoreName)
+					return
+				}
+				restore, ok := event.Object.(*filerestorev1alpha1.VirtualMachineFileRestore)
+				if !ok || restore.Name != restoreName {
+					continue
+				}
+				switch restore.Status.Phase {
+				case filerestorev1alpha1.RestorePhaseFailed, filerestorev1alpha1.RestorePhaseSucceeded:
+					result <- fmt.Errorf("restore reached terminal phase %s before interruption", restore.Status.Phase)
+					return
+				case filerestorev1alpha1.RestorePhaseRestoring:
+					result <- action()
+					return
+				}
+			}
+		}
+	}()
+	return result
+}
+
+// pauseGuestRsync waits for the actual file copy, then stops its processes so
+// a hot-unplug cannot race with the transfer finishing. It signals only rsync
+// PIDs, leaving the SSH session running so it can return the PIDs to the caller.
+func pauseGuestRsync(vmName, namespace, identityFile string) ([]int, error) {
+	const pauseCommand = `for i in $(seq 1 1200); do
+    if pgrep -x rsync >/dev/null 2>&1; then
+        if pkill -STOP -x rsync 2>/dev/null; then
+            pids=$(pgrep -x rsync | tr '\n' ' ')
+            if [ -n "$pids" ]; then
+                echo "$pids"
+                exit 0
+            fi
+        fi
+    fi
+    sleep 0.05
+done
+echo "rsync did not start within 60 seconds" >&2
+exit 1`
+	processes, err := runSSHCommandWithTimeout(vmName, namespace, pauseCommand, identityFile, 90*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("pause guest rsync: %w (output: %s)", err, processes)
+	}
+	pidStrings := strings.Fields(processes)
+	if len(pidStrings) == 0 {
+		return nil, fmt.Errorf("pause guest rsync returned no process IDs")
+	}
+	processIDs := make([]int, 0, len(pidStrings))
+	for _, pidString := range pidStrings {
+		pid, err := strconv.Atoi(pidString)
+		if err != nil {
+			return nil, fmt.Errorf("parse guest rsync process ID %q: %w", pidString, err)
+		}
+		processIDs = append(processIDs, pid)
+	}
+	return processIDs, nil
+}
+
+func resumeGuestRsync(vmName, namespace, identityFile string, processIDs []int) error {
+	if len(processIDs) == 0 {
+		return fmt.Errorf("cannot resume guest rsync: no process IDs")
+	}
+	pidStrings := make([]string, len(processIDs))
+	for i, pid := range processIDs {
+		pidStrings[i] = strconv.Itoa(pid)
+	}
+	_, err := runSSHCommand(vmName, namespace,
+		fmt.Sprintf("kill -CONT %s", strings.Join(pidStrings, " ")), identityFile)
+	if err != nil {
+		return fmt.Errorf("resume guest rsync processes %s: %w", strings.Join(pidStrings, ","), err)
+	}
+	return nil
+}
+
+func interruptGuestDiskDuringRestore(
+	virtClient kubecli.KubevirtClient, namespace, vmName, volumeName, identityFile string,
+) (resultErr error) {
+	processIDs, err := pauseGuestRsync(vmName, namespace, identityFile)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, resumeGuestRsync(vmName, namespace, identityFile, processIDs))
+	}()
+
+	device, err := findDataDiskDevice(vmName, namespace, volumeName, identityFile)
+	if err != nil {
+		return fmt.Errorf("find guest disk %s: %w", volumeName, err)
+	}
+	if err := removeVolumeFromVM(virtClient, namespace, vmName, volumeName); err != nil {
+		return err
+	}
+	if err := waitForVMIVolumeDetached(virtClient, namespace, vmName, volumeName, 2*time.Minute); err != nil {
+		return err
+	}
+	if err := waitForGuestBlockDeviceDetached(
+		vmName, namespace, device, identityFile, 2*time.Minute,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createBlankBackupPVC(k8sClient *kubernetes.Clientset, namespace, pvcName, size string) {
+	storageClassName := defaultStorageClassName(k8sClient)
+	blockMode := corev1.PersistentVolumeBlock
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: namespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeMode:  &blockMode,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)},
+			},
+			StorageClassName: storageClassName,
+		},
+	}
+	_, err := k8sClient.CoreV1().PersistentVolumeClaims(namespace).Create(
+		context.Background(), pvc, metav1.CreateOptions{},
+	)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create blank backup PVC")
+}
+
+func defaultStorageClassName(k8sClient *kubernetes.Clientset) *string {
+	storageClasses, err := k8sClient.StorageV1().StorageClasses().List(context.Background(), metav1.ListOptions{})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	for _, storageClass := range storageClasses.Items {
+		if storageClass.Annotations != nil &&
+			storageClass.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
+			return &storageClass.Name
+		}
+	}
+	if len(storageClasses.Items) > 0 {
+		return &storageClasses.Items[0].Name
+	}
+	return nil
+}
+
+func removeVolumeFromVM(
+	virtClient kubecli.KubevirtClient, namespace, vmName, volumeName string,
+) error {
+	if err := virtClient.VirtualMachine(namespace).RemoveVolume(
+		context.Background(), vmName, &kubevirtv1.RemoveVolumeOptions{Name: volumeName},
+	); err != nil {
+		return fmt.Errorf("remove volume %s from VM %s/%s: %w", volumeName, namespace, vmName, err)
+	}
+	return nil
+}
+
+func hotplugPVCToVM(
+	virtClient kubecli.KubevirtClient, namespace, vmName, volumeName, pvcName string,
+) error {
+	vm, err := virtClient.VirtualMachine(namespace).Get(context.Background(), vmName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes, kubevirtv1.Volume{
+		Name: volumeName,
+		VolumeSource: kubevirtv1.VolumeSource{
+			PersistentVolumeClaim: &kubevirtv1.PersistentVolumeClaimVolumeSource{
+				PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
+				Hotpluggable:                      true,
+			},
+		},
+	})
+	vm.Spec.Template.Spec.Domain.Devices.Disks = append(vm.Spec.Template.Spec.Domain.Devices.Disks, kubevirtv1.Disk{
+		Name:       volumeName,
+		DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: kubevirtv1.DiskBusSCSI}},
+		Serial:     volumeName,
+	})
+	_, err = virtClient.VirtualMachine(namespace).Update(context.Background(), vm, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("hotplug PVC %s as volume %s: %w", pvcName, volumeName, err)
+	}
+	return nil
+}
+
+func waitForVMIVolumeDetached(
+	virtClient kubecli.KubevirtClient, namespace, vmiName, volumeName string, timeout time.Duration,
+) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		vmi, err := virtClient.VirtualMachineInstance(namespace).Get(
+			context.Background(), vmiName, metav1.GetOptions{},
+		)
+		if err != nil {
+			return err
+		}
+		attached := false
+		for _, volume := range vmi.Spec.Volumes {
+			if volume.Name == volumeName {
+				attached = true
+				break
+			}
+		}
+		for _, disk := range vmi.Spec.Domain.Devices.Disks {
+			if disk.Name == volumeName {
+				attached = true
+				break
+			}
+		}
+		for _, status := range vmi.Status.VolumeStatus {
+			if status.Name == volumeName {
+				attached = true
+				break
+			}
+		}
+		if !attached {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("volume %s remained attached to VMI %s/%s", volumeName, namespace, vmiName)
+}
+
+func waitForGuestBlockDeviceDetached(
+	vmiName, namespace, device, identityFile string, timeout time.Duration,
+) error {
+	devicePath := "/dev/" + device
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, err := runSSHCommand(vmiName, namespace,
+			fmt.Sprintf("test ! -b %s", shellEscape(devicePath)), identityFile)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("block device %s remained accessible in guest %s/%s", devicePath, namespace, vmiName)
+}
+
+func createLargeFileOnVM(vmiName, namespace, path string, sizeBytes int64, identityFile string) {
+	const mebibyte = int64(1024 * 1024)
+	blockCount := (sizeBytes + mebibyte - 1) / mebibyte
+	command := fmt.Sprintf(
+		"dd if=/dev/urandom of=%s bs=1M count=%d iflag=fullblock status=none && sync",
+		shellEscape(path), blockCount,
+	)
+	_, err := runSSHCommandWithTimeout(vmiName, namespace, command, identityFile, 10*time.Minute)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create large file at %s", path)
 }
 
 func prepareBootDiskRestoreSnapshot(env *TestEnv, snapName, dataPath, dataFile, content string) {
