@@ -48,7 +48,7 @@ func metricsClusterRoleBindingName(operatorNS string) string {
 	return fmt.Sprintf("%s-%s", metricsRoleBindingName, operatorNS)
 }
 
-var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
+var _ = Describe("VM File Restore Operator", Ordered, ContinueOnFailure, func() {
 	var namespace string // operator namespace (configurable for QE)
 
 	// Operator and namespace are already deployed via 'make cluster-sync' or QE setup.sh
@@ -90,7 +90,7 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 	SetDefaultEventuallyTimeout(2 * time.Minute)
 	SetDefaultEventuallyPollingInterval(time.Second)
 
-	Context("Manager", func() {
+	Context("Controller manager health and metrics", func() {
 		It("should run successfully", func() {
 			By("validating that the operator pod is running as expected")
 			verifyControllerUp := func(g Gomega) {
@@ -228,7 +228,9 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
+	})
 
+	Context("Positive restore scenarios", func() {
 		Context("standard restore operations", Ordered, func() {
 			var sharedEnv *TestEnv
 			BeforeAll(func() {
@@ -677,95 +679,6 @@ sync
 			})
 
 			/*
-				[NEGATIVE] Volume attachment failure.
-
-				Preconditions:
-					- Running Linux VM with guest helper configured
-					- No PVC named in the restore CR exists in the namespace
-
-				Steps:
-					1. Create VirtualMachineFileRestore CR referencing a non-existent PVC
-					2. Wait for restore to reach Failed phase
-					3. Read status.errorMessage
-					4. Inspect VMI for orphaned backup volumes
-
-				Expected: Failed with message describing attachment/source failure; no orphaned volumes
-			*/
-			It("should report a clear error when volume attachment fails during restore", func() {
-				env := sharedEnv
-				restoreName := "restore-missing-pvc"
-				DeferCleanup(func() { deleteFileRestoreIfExists(env, restoreName) })
-
-				By("creating VirtualMachineFileRestore CR referencing a non-existent PVC")
-				err := createFileRestoreCRFromPVC(
-					env.CRClient, env.Namespace, restoreName, vmName, "does-not-exist-pvc", "/home/donald",
-				)
-				Expect(err).NotTo(HaveOccurred())
-
-				By("waiting for Failed phase")
-				restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 3*time.Minute)
-				msg := strings.ToLower(restore.Status.ErrorMessage)
-				Expect(msg).To(And(
-					ContainSubstring("does-not-exist-pvc"),
-					ContainSubstring("not found"),
-				), "errorMessage should name the missing PVC: %s", restore.Status.ErrorMessage)
-
-				By("verifying no orphaned restore volume remains attached")
-				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, restoreName)
-			})
-
-			/*
-				[NEGATIVE] File transfer failure.
-
-				Preconditions:
-					- Running Linux VM with guest helper and filerestore SSH user configured
-					- Backup snapshot exists but does not contain the source path specified in the CR
-
-				Steps:
-					1. Create VirtualMachineFileRestore CR with a non-existent source path
-					2. Wait for restore to reach Failed phase
-					3. Read status.errorMessage
-					4. Verify no file was created at the target path
-					5. Verify hotplugged volume is detached after failure
-
-				Expected: Failed with transfer/path error; target unchanged; volume cleaned up
-			*/
-			It("should report a clear error when file transfer fails during restore", func() {
-				const (
-					xferSnap    = "fedora-xfer-fail-snap"
-					xferRestore = "restore-xfer-fail"
-					missingPath = "/home/donald/does-not-exist-on-backup"
-				)
-
-				env := sharedEnv
-				DeferCleanup(func() {
-					deleteFileRestoreIfExists(env, xferRestore)
-					deleteSnapshotIfExists(env, xferSnap)
-				})
-
-				By("creating VolumeSnapshot of a disk that lacks the restore source path")
-				err := createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, xferSnap)
-				Expect(err).NotTo(HaveOccurred())
-				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, xferSnap)
-
-				By("creating VirtualMachineFileRestore CR with non-existent sourcePath")
-				err = createFileRestoreCR(env.CRClient, env.Namespace, xferRestore, xferSnap, missingPath)
-				Expect(err).NotTo(HaveOccurred())
-
-				By("waiting for Failed phase")
-				restore := waitForRestoreFailed(env.CRClient, env.Namespace, xferRestore, 5*time.Minute)
-				Expect(restore.Status.ErrorMessage).NotTo(BeEmpty())
-
-				By("verifying target path was not created")
-				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", missingPath), env.PrivateKeyPath)
-				Expect(err).NotTo(HaveOccurred(), "unexpected path created after failed transfer")
-
-				By("verifying hotplugged volume is cleaned up")
-				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, xferRestore)
-				assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, xferRestore)
-			})
-
-			/*
 				Temporary resources cleaned up after successful restore.
 
 				Preconditions:
@@ -857,111 +770,6 @@ sync
 				assertExpectedRestorePhases(watcher.snapshot())
 			})
 		}) // end Context("standard restore operations") — shared VM is torn down here before special-VM tests
-
-		/*
-			[NEGATIVE] Guest connection failure.
-
-			Preconditions:
-				- Running Linux VM without filerestore SSH user / guest helper
-				- Valid backup snapshot that can be hotplugged
-
-			Steps:
-				1. Create VirtualMachineFileRestore CR targeting the VM without helper configured
-				2. Wait for restore to reach Failed phase
-				3. Read status.errorMessage
-				4. Verify hotplugged volume is detached after failure
-
-			Expected: Failed with SSH/guest connection message; hotplugged volume cleaned up
-		*/
-		It("should report a clear error when guest connection cannot be established during restore", func() {
-			const (
-				sshFailSnap    = "fedora-ssh-fail-snap"
-				sshFailRestore = "restore-ssh-fail"
-			)
-
-			env := setupTestVMWithoutGuestHelper("e2e-ssh-fail")
-
-			By("creating a file so the snapshot has content")
-			_, err := runSSHCommand(vmName, env.Namespace,
-				"mkdir -p /root/ssh-fail-data && echo data > /root/ssh-fail-data/file.txt && sync",
-				env.PrivateKeyPath)
-			Expect(err).NotTo(HaveOccurred())
-			time.Sleep(2 * time.Second)
-
-			By("creating VolumeSnapshot")
-			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, sshFailSnap)
-			Expect(err).NotTo(HaveOccurred())
-			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, sshFailSnap)
-
-			By("creating VirtualMachineFileRestore CR against VM without filerestore user")
-			err = createFileRestoreCR(
-				env.CRClient, env.Namespace, sshFailRestore, sshFailSnap, "/root/ssh-fail-data",
-			)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for Failed phase (SSH retries ~2 minutes)")
-			restore := waitForRestoreFailed(env.CRClient, env.Namespace, sshFailRestore, 5*time.Minute)
-			msg := strings.ToLower(restore.Status.ErrorMessage)
-			Expect(msg).To(Or(
-				ContainSubstring("ssh"),
-				ContainSubstring("connection"),
-				ContainSubstring("timeout"),
-			), "errorMessage should indicate SSH/guest connection failure: %s", restore.Status.ErrorMessage)
-
-			By("verifying hotplugged volume is cleaned up")
-			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, sshFailRestore)
-			assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, sshFailRestore)
-		})
-
-		/*
-			[NEGATIVE] Invalid restore source combinations.
-
-			Thin e2e smoke: empty source + one multi-source case. Fuller combinations
-			are covered by the VirtualMachineFileRestore controller unit tests.
-		*/
-		DescribeTable("should fail restore when source is empty or specifies more than one of pvc, snapshot, remote",
-			func(restoreName string, source filerestorev1alpha1.RestoreSource, errSubstring string) {
-				env := setupTestEnv("e2e-invalid-source")
-
-				restore := &filerestorev1alpha1.VirtualMachineFileRestore{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      restoreName,
-						Namespace: env.Namespace,
-					},
-					Spec: filerestorev1alpha1.VirtualMachineFileRestoreSpec{
-						Target: corev1.TypedLocalObjectReference{
-							APIGroup: kubevirtAPIGroupPtr(),
-							Kind:     "VirtualMachine",
-							Name:     "does-not-matter",
-						},
-						Source:     source,
-						SourcePath: "/home/donald",
-					},
-				}
-
-				By("creating VirtualMachineFileRestore CR with invalid source")
-				err := env.CRClient.Create(context.Background(), restore)
-				Expect(err).NotTo(HaveOccurred(), "CR create should succeed; validation happens in reconcile")
-
-				By("waiting for Failed phase with a clear source validation error")
-				failed := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 2*time.Minute)
-				Expect(strings.ToLower(failed.Status.ErrorMessage)).To(ContainSubstring(strings.ToLower(errSubstring)),
-					"errorMessage %q should contain %q", failed.Status.ErrorMessage, errSubstring)
-			},
-			Entry("empty source (0 of pvc/snapshot/remote)",
-				"restore-no-source",
-				filerestorev1alpha1.RestoreSource{},
-				"no source specified",
-			),
-			Entry("pvc and snapshot (2 sources)",
-				"restore-pvc-and-snap",
-				filerestorev1alpha1.RestoreSource{
-					PVC:      &filerestorev1alpha1.PVCSource{Name: "backup-pvc"},
-					Snapshot: &filerestorev1alpha1.VolumeSnapshotSource{Name: "backup-snap"},
-				},
-				"multiple sources specified",
-			),
-		)
 
 		// When a snapshot of an LVM disk is hotplugged into the same VM, the snapshot
 		// carries identical VG/PV UUIDs to the already-active volume group, causing
@@ -1166,6 +974,561 @@ umount /mnt/lvmdata
 				Entry("ext4", "ext4", "ext4-data-dv"),
 				Entry("xfs", "xfs", "xfs-data-dv"),
 			)
+		})
+	})
+
+	Context("Negative restore scenarios", Ordered, func() {
+		/*
+			[NEGATIVE] Target VM does not exist.
+
+			Preconditions: A backup PVC exists, but the target VM does not.
+			Steps: Create a restore CR targeting the missing VM and wait for Failed.
+			Expected: The failure details report that the target VM was not found.
+		*/
+		It("[NEGATIVE] should report an informative error for a non-existent VM", func() {
+			const (
+				restoreName = "no-vm"
+				pvcName     = "no-vm-pvc"
+			)
+
+			By("setting up a test namespace without a target VM")
+			env := setupTestEnv("e2e-no-vm")
+			DeferCleanup(func() { deleteFileRestoreIfExists(env, restoreName) })
+
+			By("creating the backup source PVC")
+			createBlankBackupPVC(env.K8sClient, env.Namespace, pvcName, "1Gi")
+
+			By("creating a restore CR that references a non-existent VM")
+			err := createFileRestoreCRFromPVC(
+				env.CRClient, env.Namespace, restoreName, "vm-that-does-not-exist", pvcName, "/home/donald",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the restore fails with a target-VM-not-found error")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 5*time.Minute)
+			assertErrorMessageContains(restore, "not found")
+		})
+
+		/*
+			[NEGATIVE] Invalid restore source combinations.
+
+			Thin e2e smoke: empty source + one multi-source case. Fuller combinations
+			are covered by the VirtualMachineFileRestore controller unit tests.
+		*/
+		DescribeTable("should fail restore when source is empty or specifies more than one of pvc, snapshot, remote",
+			func(restoreName string, source filerestorev1alpha1.RestoreSource, errSubstring string) {
+				env := setupTestEnv("e2e-invalid-source")
+
+				restore := &filerestorev1alpha1.VirtualMachineFileRestore{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      restoreName,
+						Namespace: env.Namespace,
+					},
+					Spec: filerestorev1alpha1.VirtualMachineFileRestoreSpec{
+						Target: corev1.TypedLocalObjectReference{
+							APIGroup: kubevirtAPIGroupPtr(),
+							Kind:     "VirtualMachine",
+							Name:     "does-not-matter",
+						},
+						Source:     source,
+						SourcePath: "/home/donald",
+					},
+				}
+
+				By("creating VirtualMachineFileRestore CR with invalid source")
+				err := env.CRClient.Create(context.Background(), restore)
+				Expect(err).NotTo(HaveOccurred(), "CR create should succeed; validation happens in reconcile")
+
+				By("waiting for Failed phase with a clear source validation error")
+				failed := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 2*time.Minute)
+				Expect(strings.ToLower(failed.Status.ErrorMessage)).To(ContainSubstring(strings.ToLower(errSubstring)),
+					"errorMessage %q should contain %q", failed.Status.ErrorMessage, errSubstring)
+			},
+			Entry("empty source (0 of pvc/snapshot/remote)",
+				"restore-no-source",
+				filerestorev1alpha1.RestoreSource{},
+				"no source specified",
+			),
+			Entry("pvc and snapshot (2 sources)",
+				"restore-pvc-and-snap",
+				filerestorev1alpha1.RestoreSource{
+					PVC:      &filerestorev1alpha1.PVCSource{Name: "backup-pvc"},
+					Snapshot: &filerestorev1alpha1.VolumeSnapshotSource{Name: "backup-snap"},
+				},
+				"multiple sources specified",
+			),
+		)
+
+		/*
+			[NEGATIVE] Guest connection failure.
+
+			Preconditions:
+				- Running Linux VM without filerestore SSH user / guest helper
+				- Valid backup snapshot that can be hotplugged
+
+			Steps:
+				1. Create VirtualMachineFileRestore CR targeting the VM without helper configured
+				2. Wait for restore to reach Failed phase
+				3. Read status.errorMessage
+				4. Verify hotplugged volume is detached after failure
+
+			Expected: Failed with SSH/guest connection message; hotplugged volume cleaned up
+		*/
+		It("should report a clear error when guest connection cannot be established during restore", func() {
+			const (
+				sshFailSnap    = "fedora-ssh-fail-snap"
+				sshFailRestore = "restore-ssh-fail"
+			)
+
+			env := setupTestVMWithoutGuestHelper("e2e-ssh-fail")
+
+			By("creating a file so the snapshot has content")
+			_, err := runSSHCommand(vmName, env.Namespace,
+				"mkdir -p /root/ssh-fail-data && echo data > /root/ssh-fail-data/file.txt && sync",
+				env.PrivateKeyPath)
+			Expect(err).NotTo(HaveOccurred())
+			time.Sleep(2 * time.Second)
+
+			By("creating VolumeSnapshot")
+			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, sshFailSnap)
+			Expect(err).NotTo(HaveOccurred())
+			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, sshFailSnap)
+
+			By("creating VirtualMachineFileRestore CR against VM without filerestore user")
+			err = createFileRestoreCR(
+				env.CRClient, env.Namespace, sshFailRestore, sshFailSnap, "/root/ssh-fail-data",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for Failed phase (SSH retries ~2 minutes)")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, sshFailRestore, 5*time.Minute)
+			msg := strings.ToLower(restore.Status.ErrorMessage)
+			Expect(msg).To(Or(
+				ContainSubstring("ssh"),
+				ContainSubstring("connection"),
+				ContainSubstring("timeout"),
+			), "errorMessage should indicate SSH/guest connection failure: %s", restore.Status.ErrorMessage)
+
+			By("verifying hotplugged volume is cleaned up")
+			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, sshFailRestore)
+			assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, sshFailRestore)
+		})
+
+		Context("shared VM negative scenarios", Ordered, func() {
+			var env *TestEnv
+
+			BeforeAll(func() {
+				env = setupTestVM("e2e-negative-shared")
+			})
+
+			/*
+				[NEGATIVE] Volume attachment failure.
+
+				Preconditions:
+					- Running Linux VM with guest helper configured
+					- No PVC named in the restore CR exists in the namespace
+
+				Steps:
+					1. Create VirtualMachineFileRestore CR referencing a non-existent PVC
+					2. Wait for restore to reach Failed phase
+					3. Read status.errorMessage
+					4. Inspect VMI for orphaned backup volumes
+
+				Expected: Failed with message describing attachment/source failure; no orphaned volumes
+			*/
+			It("should report a clear error when volume attachment fails during restore", func() {
+				restoreName := "restore-missing-pvc"
+				DeferCleanup(func() { deleteFileRestoreIfExists(env, restoreName) })
+
+				By("creating VirtualMachineFileRestore CR referencing a non-existent PVC")
+				err := createFileRestoreCRFromPVC(
+					env.CRClient, env.Namespace, restoreName, vmName, "does-not-exist-pvc", "/home/donald",
+				)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for Failed phase")
+				restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 3*time.Minute)
+				msg := strings.ToLower(restore.Status.ErrorMessage)
+				Expect(msg).To(And(
+					ContainSubstring("does-not-exist-pvc"),
+					ContainSubstring("not found"),
+				), "errorMessage should name the missing PVC: %s", restore.Status.ErrorMessage)
+
+				By("verifying no orphaned restore volume remains attached")
+				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, restoreName)
+			})
+
+			/*
+				[NEGATIVE] File transfer failure.
+
+				Preconditions:
+					- Running Linux VM with guest helper and filerestore SSH user configured
+					- Backup snapshot exists but does not contain the source path specified in the CR
+
+				Steps:
+					1. Create VirtualMachineFileRestore CR with a non-existent source path
+					2. Wait for restore to reach Failed phase
+					3. Read status.errorMessage
+					4. Verify no file was created at the target path
+					5. Verify hotplugged volume is detached after failure
+
+				Expected: Failed with transfer/path error; target unchanged; volume cleaned up
+			*/
+			It("should report a clear error when file transfer fails during restore", func() {
+				const (
+					xferSnap    = "fedora-xfer-fail-snap"
+					xferRestore = "restore-xfer-fail"
+					missingPath = "/home/donald/does-not-exist-on-backup"
+				)
+
+				DeferCleanup(func() {
+					deleteFileRestoreIfExists(env, xferRestore)
+					deleteSnapshotIfExists(env, xferSnap)
+				})
+
+				By("creating VolumeSnapshot of a disk that lacks the restore source path")
+				err := createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, xferSnap)
+				Expect(err).NotTo(HaveOccurred())
+				waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, xferSnap)
+
+				By("creating VirtualMachineFileRestore CR with non-existent sourcePath")
+				err = createFileRestoreCR(env.CRClient, env.Namespace, xferRestore, xferSnap, missingPath)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for Failed phase")
+				restore := waitForRestoreFailed(env.CRClient, env.Namespace, xferRestore, 5*time.Minute)
+				Expect(restore.Status.ErrorMessage).NotTo(BeEmpty())
+
+				By("verifying target path was not created")
+				_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("test ! -e %s", missingPath), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "unexpected path created after failed transfer")
+
+				By("verifying hotplugged volume is cleaned up")
+				assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, xferRestore)
+				assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, xferRestore)
+			})
+
+			/*
+				[NEGATIVE] Shell metacharacters in the source path.
+
+				Preconditions: A sentinel file and a backup snapshot exist in the guest.
+				Steps: Request a restore with a source path containing a command to delete the sentinel.
+				Expected: The restore fails; the sentinel remains and no injected command is running.
+			*/
+			It("[NEGATIVE] should reject paths containing shell metacharacters without executing injected commands", func() {
+				const (
+					restoreName  = "injection"
+					snapName     = "injection-snap"
+					sentinelPath = "/home/donald/injection-sentinel"
+					injectPath   = "/home/donald/data; rm -f /home/donald/injection-sentinel"
+				)
+
+				DeferCleanup(func() {
+					deleteFileRestoreIfExists(env, restoreName)
+					deleteSnapshotIfExists(env, snapName)
+				})
+
+				By("creating a sentinel file that the injected command would remove")
+				ensureRestoreTestUser(env)
+				_, err := runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("echo sentinel > %s && sync", shellEscape(sentinelPath)), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				waitForGuestFile(env, sentinelPath)
+
+				By("creating the backup snapshot")
+				snapshotBootDisk(env, snapName)
+
+				By("creating a restore CR with shell metacharacters in the source path")
+				err = createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, injectPath)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying the unsafe restore request fails")
+				restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 10*time.Minute)
+				assertErrorMessageContains(restore, "Unknown argument:")
+
+				By("verifying the injected command did not remove the sentinel file")
+				_, err = runSSHCommand(vmName, env.Namespace,
+					fmt.Sprintf("test -f %s", shellEscape(sentinelPath)), env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred(), "sentinel file should not be deleted by injection")
+
+				By("verifying no injected command remains running in the guest")
+				processes, err := runSSHCommand(vmName, env.Namespace,
+					"ps aux | grep -E '[;]rm' | grep -v grep || true", env.PrivateKeyPath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(processes)).To(BeEmpty(), "unexpected injected processes running")
+			})
+
+			/*
+				[NEGATIVE] Unformatted backup volume.
+
+				Preconditions: A running VM and a blank backup PVC exist.
+				Steps: Request a restore from the blank PVC and wait for Failed.
+				Expected: The failure details report that no mountable filesystem was found.
+			*/
+			It("[NEGATIVE] should report an informative error for an empty backup volume", func() {
+				const (
+					restoreName = "empty-backup"
+					pvcName     = "empty-backup-pvc"
+				)
+
+				DeferCleanup(func() {
+					deleteFileRestoreIfExists(env, restoreName)
+					_ = env.K8sClient.CoreV1().PersistentVolumeClaims(env.Namespace).Delete(
+						context.Background(), pvcName, metav1.DeleteOptions{},
+					)
+				})
+
+				By("creating an empty backup source PVC")
+				createBlankBackupPVC(env.K8sClient, env.Namespace, pvcName, "1Gi")
+
+				By("creating a restore CR that references data on the empty backup volume")
+				err := createFileRestoreCRFromPVC(
+					env.CRClient, env.Namespace, restoreName, vmName, pvcName, "/home/donald/missing",
+				)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying the restore fails with an informative backup-volume error")
+				restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 10*time.Minute)
+				assertErrorMessageContains(restore, "No mountable filesystem found")
+			})
+		})
+
+		/*
+			[NEGATIVE] Backup source volume unplugged during restore.
+
+			Preconditions: A snapshot contains a large file to keep the transfer active.
+			Steps: Start the restore, pause the guest transfer, and unplug the source volume.
+			Expected: The volume detaches and the restore fails with a source-volume error.
+		*/
+		It("[NEGATIVE] should report a clear error when the backup source volume is unplugged during restore", func() {
+			const (
+				restoreName = "src-unplug"
+				snapName    = "src-unplug-snap"
+				dataDir     = "/home/donald/src-unplug-data"
+				largeFile   = "/home/donald/src-unplug-data/bigfile.dat"
+			)
+
+			env := setupTestVM("e2e-src-unplug")
+			DeferCleanup(func() {
+				deleteFileRestoreIfExists(env, restoreName)
+				deleteSnapshotIfExists(env, snapName)
+			})
+
+			By("creating a large source file for the backup snapshot")
+			ensureRestoreTestUser(env)
+			_, err := runSSHCommand(vmName, env.Namespace,
+				fmt.Sprintf("mkdir -p %s", shellEscape(dataDir)), env.PrivateKeyPath)
+			Expect(err).NotTo(HaveOccurred())
+			createLargeFileOnVM(vmName, env.Namespace, largeFile, 1024*1024*1024, env.PrivateKeyPath)
+
+			By("creating the backup snapshot")
+			snapshotBootDisk(env, snapName)
+
+			By("removing the live file so restore must recreate it")
+			_, err = runSSHCommand(vmName, env.Namespace,
+				fmt.Sprintf("rm -rf %s", shellEscape(dataDir)), env.PrivateKeyPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("scheduling the backup source volume to be unplugged during the restore")
+			interruptResult := interruptGuestRestoreWhileRunning(
+				env.CRClient, env.Namespace, restoreName, 10*time.Minute, func() error {
+					return interruptGuestDiskDuringRestore(
+						env.VirtClient, env.Namespace, vmName, restoreVolumeName(restoreName), env.PrivateKeyPath)
+				})
+
+			By("creating the restore CR")
+			err = createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, dataDir)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the backup source volume was unplugged")
+			Eventually(interruptResult, 10*time.Minute).Should(Receive(Succeed()))
+
+			By("verifying the restore fails with a source-volume error")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 10*time.Minute)
+			assertErrorMessageContains(restore,
+				fmt.Sprintf("error: failed to restore %s from source volume", dataDir))
+		})
+
+		/*
+			[NEGATIVE] Target VM disk unplugged during restore.
+
+			Preconditions: A running VM has a populated target data disk and a backup snapshot.
+			Steps: Start the restore, pause the guest transfer, and unplug the target disk.
+			Expected: The restore fails with an error and the temporary restore volume detaches.
+		*/
+		It("[NEGATIVE] should report a clear error when the target VM disk is unplugged during restore", func() {
+			const (
+				targetPVCName    = "target-data-pvc"
+				targetVolumeName = "target-data-volume"
+				restoreName      = "target-unplug"
+				snapName         = "target-unplug-snap"
+				mountPoint       = "/mnt/target-data"
+				sourcePath       = "/mnt/target-data/restore-target.dat"
+				mirrorDir        = "/mnt/target-data/mnt/target-data"
+				mirrorFile       = "/mnt/target-data/mnt/target-data/restore-target.dat"
+			)
+
+			env := setupTestVM("e2e-target-unplug")
+			DeferCleanup(func() {
+				deleteFileRestoreIfExists(env, restoreName)
+				deleteSnapshotIfExists(env, snapName)
+			})
+
+			By("hotplugging the target data disk")
+			createBlankBackupPVC(env.K8sClient, env.Namespace, targetPVCName, "2Gi")
+			Expect(hotplugPVCToVM(
+				env.VirtClient, env.Namespace, vmName, targetVolumeName, targetPVCName,
+			)).To(Succeed())
+
+			By("formatting and populating the target data disk")
+			formatDataDisk(vmName, env.Namespace, targetVolumeName, mountPoint, "ext4", env.PrivateKeyPath)
+			_, err := runSSHCommand(vmName, env.Namespace,
+				fmt.Sprintf("mkdir -p %s", shellEscape(mirrorDir)), env.PrivateKeyPath)
+			Expect(err).NotTo(HaveOccurred())
+			createLargeFileOnVM(vmName, env.Namespace, mirrorFile, 512*1024*1024, env.PrivateKeyPath)
+
+			By("creating a snapshot of the target data disk")
+			err = createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, targetPVCName, snapName)
+			Expect(err).NotTo(HaveOccurred())
+			waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapName)
+
+			By("scheduling the target data disk to be unplugged during the restore")
+			unplugResult := interruptGuestRestoreWhileRunning(
+				env.CRClient, env.Namespace, restoreName, 10*time.Minute, func() error {
+					return interruptGuestDiskDuringRestore(
+						env.VirtClient, env.Namespace, vmName, targetVolumeName, env.PrivateKeyPath)
+				})
+
+			By("creating the restore CR")
+			err = createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, sourcePath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the target disk was unplugged")
+			Eventually(unplugResult, 10*time.Minute).Should(Receive(Succeed()))
+
+			By("verifying the restore fails with a clear error")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 10*time.Minute)
+			assertErrorMessageContains(restore,
+				fmt.Sprintf("Failed to restore %s from source volume", sourcePath))
+
+			By("verifying the temporary restore volume was detached")
+			assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, restoreName)
+		})
+
+		/*
+			[NEGATIVE] Operator SSH key missing from the guest.
+
+			Preconditions: The guest helper is installed with a different SSH public key.
+			Steps: Create a restore CR for a valid snapshot and wait for Failed.
+			Expected: The failure details report an SSH connection failure.
+		*/
+		It("[NEGATIVE] should fail with a clear SSH authentication error when the operator key is missing", func() {
+			const (
+				restoreName = "ssh-key-missing"
+				snapName    = "ssh-key-missing-snap"
+				dataPath    = "/home/donald/ssh-key-missing-data"
+				dataFile    = "/home/donald/ssh-key-missing-data/file.txt"
+			)
+
+			env := setupTestVMWithoutGuestHelper("e2e-ssh-key-missing")
+			DeferCleanup(func() {
+				deleteFileRestoreIfExists(env, restoreName)
+				deleteSnapshotIfExists(env, snapName)
+			})
+
+			By("installing the guest helper without the operator SSH key")
+			installGuestHelperWithoutOperatorKey(env)
+
+			By("preparing the backup snapshot")
+			prepareBootDiskRestoreSnapshot(env, snapName, dataPath, dataFile, "ssh-key-missing")
+
+			By("creating the restore CR")
+			err := createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, dataPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the restore fails with an SSH authentication error")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 10*time.Minute)
+			assertErrorMessageContains(restore, "SSH connection failed")
+		})
+
+		/*
+			[NEGATIVE] Guest helper missing.
+
+			Preconditions:
+				- Running Linux VM with SSH access and the operator key configured
+				- A valid boot-disk snapshot can be prepared
+
+			Steps:
+				1. Remove filerestore.sh from the guest and prepare the backup snapshot
+				2. Create a restore CR for a path in that snapshot
+				3. Wait for the restore to reach Failed phase
+
+			Expected: The error identifies the missing filerestore.sh helper
+		*/
+		It("[NEGATIVE] should report a clear error when the filerestore helper is absent from the VM", func() {
+			const (
+				restoreName = "no-helper"
+				snapName    = "no-helper-snap"
+				dataPath    = "/home/donald/no-helper-data"
+				dataFile    = "/home/donald/no-helper-data/file.txt"
+			)
+
+			env := setupTestVM("e2e-no-helper")
+			DeferCleanup(func() {
+				deleteFileRestoreIfExists(env, restoreName)
+				deleteSnapshotIfExists(env, snapName)
+			})
+
+			By("removing the filerestore helper from the guest")
+			removeFilerestoreHelperBinary(env)
+
+			By("preparing the backup snapshot")
+			prepareBootDiskRestoreSnapshot(env, snapName, dataPath, dataFile, "no-helper")
+
+			By("creating the restore CR")
+			err := createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, dataPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the restore fails with a missing-helper error")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 10*time.Minute)
+			assertErrorMessageContains(restore, "filerestore.sh: No such file or directory")
+		})
+
+		/*
+			[NEGATIVE] Target VM is stopped.
+
+			Preconditions: A valid backup snapshot exists for the target VM.
+			Steps: Stop the VM, create a restore CR, and wait for Failed.
+			Expected: The failure details report that the target VM is not running.
+		*/
+		It("[NEGATIVE] should report an informative error when the target VM is not running", func() {
+			const (
+				restoreName = "stopped-vm"
+				snapName    = "stopped-vm-snap"
+				dataPath    = "/home/donald/stopped-vm-data"
+				dataFile    = "/home/donald/stopped-vm-data/file.txt"
+			)
+
+			env := setupTestVM("e2e-stopped-vm")
+			DeferCleanup(func() {
+				deleteFileRestoreIfExists(env, restoreName)
+				deleteSnapshotIfExists(env, snapName)
+			})
+
+			By("preparing the backup snapshot")
+			prepareBootDiskRestoreSnapshot(env, snapName, dataPath, dataFile, "stopped-vm")
+
+			By("stopping the target VM")
+			stopVM(env.VirtClient, env.Namespace, vmName)
+
+			By("creating the restore CR")
+			err := createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, dataPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the restore fails with a target-VM-not-running error")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 5*time.Minute)
+			assertErrorMessageContains(restore,
+				fmt.Sprintf("target VM %s is not running (no VMI found)", vmName))
 		})
 	})
 
