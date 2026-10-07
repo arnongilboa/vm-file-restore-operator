@@ -29,6 +29,7 @@ import (
 	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	filerestorev1alpha1 "kubevirt.io/vm-file-restore-operator/api/v1alpha1"
@@ -1773,6 +1774,94 @@ umount /mnt/lvmdata
 			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 5*time.Minute)
 			assertErrorMessageContains(restore,
 				fmt.Sprintf("target VM %s is not running (no VMI found)", vmName))
+		})
+
+		/*
+			[NEGATIVE] DataVolume provisioning blocked by ResourceQuota.
+
+			Preconditions:
+				- Running Linux VM with guest helper configured
+				- A valid boot-disk VolumeSnapshot exists
+				- A ResourceQuota caps persistentvolumeclaims at the current namespace count,
+				  preventing CDI from provisioning the DataVolume's backing PVC
+
+			Steps:
+				1. Set up a VM environment and create a boot-disk snapshot
+				2. Apply a ResourceQuota that blocks any new PVC in the test namespace
+				3. Create a VirtualMachineFileRestore CR using the snapshot as source
+				4. Wait for the restore to reach Failed phase (provisioning timeout ~2 minutes)
+				5. Verify the error message mentions DataVolume provisioning timeout
+				6. Verify the stuck DataVolume was cleaned up by the operator
+
+			Expected: VMFR reaches Failed after the 2-minute provisioning timeout;
+			the stuck DataVolume is removed as part of failure cleanup.
+		*/
+		It("[NEGATIVE] should fail when DataVolume provisioning is blocked by a ResourceQuota", func() {
+			const (
+				restoreName = "dv-quota-fail"
+				snapName    = "dv-quota-fail-snap"
+				quotaName   = "dv-quota-block"
+				dataPath    = "/home/donald/dv-quota-data"
+				dataFile    = "/home/donald/dv-quota-data/file.txt"
+			)
+
+			env := setupTestVM("e2e-dv-quota-fail")
+			DeferCleanup(func() {
+				_ = env.K8sClient.CoreV1().ResourceQuotas(env.Namespace).Delete(
+					context.Background(), quotaName, metav1.DeleteOptions{},
+				)
+				deleteFileRestoreIfExists(env, restoreName)
+				deleteSnapshotIfExists(env, snapName)
+			})
+
+			By("preparing the backup snapshot")
+			prepareBootDiskRestoreSnapshot(env, snapName, dataPath, dataFile, "dv-quota")
+
+			By("counting PVCs in the namespace to derive a blocking quota")
+			pvcList, err := env.K8sClient.CoreV1().PersistentVolumeClaims(env.Namespace).List(
+				context.Background(), metav1.ListOptions{},
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("applying a ResourceQuota that prevents any new PVC from being created")
+			pvcLimit := resource.MustParse(fmt.Sprintf("%d", len(pvcList.Items)))
+			quota := &corev1.ResourceQuota{
+				ObjectMeta: metav1.ObjectMeta{Name: quotaName, Namespace: env.Namespace},
+				Spec: corev1.ResourceQuotaSpec{
+					Hard: corev1.ResourceList{
+						corev1.ResourcePersistentVolumeClaims: pvcLimit,
+					},
+				},
+			}
+			_, err = env.K8sClient.CoreV1().ResourceQuotas(env.Namespace).Create(
+				context.Background(), quota, metav1.CreateOptions{},
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the ResourceQuota status to be enforced by the admission controller")
+			Eventually(func(g Gomega) {
+				current, getErr := env.K8sClient.CoreV1().ResourceQuotas(env.Namespace).Get(
+					context.Background(), quotaName, metav1.GetOptions{},
+				)
+				g.Expect(getErr).NotTo(HaveOccurred())
+				hard, hasHard := current.Status.Hard[corev1.ResourcePersistentVolumeClaims]
+				used, hasUsed := current.Status.Used[corev1.ResourcePersistentVolumeClaims]
+				g.Expect(hasHard).To(BeTrue(), "quota Status.Hard not yet populated")
+				g.Expect(hasUsed).To(BeTrue(), "quota Status.Used not yet populated")
+				g.Expect(hard.Cmp(pvcLimit)).To(Equal(0), "quota Status.Hard does not match spec")
+				g.Expect(used.Cmp(hard)).To(Equal(0), "quota not yet at capacity (used != hard)")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("creating the restore CR (DataVolume provisioning will be blocked by the quota)")
+			err = createFileRestoreCR(env.CRClient, env.Namespace, restoreName, snapName, dataPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for Failed phase (~2 minutes, DataVolume provisioning timeout)")
+			restore := waitForRestoreFailed(env.CRClient, env.Namespace, restoreName, 5*time.Minute)
+			assertErrorMessageContains(restore, "timed out", "Pending")
+
+			By("verifying the operator cleaned up the stuck DataVolume")
+			assertNoManagedRestoreDataVolume(env.CRClient, env.Namespace, restoreName)
 		})
 	})
 
