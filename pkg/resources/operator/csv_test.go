@@ -19,6 +19,8 @@ package operator
 import (
 	"testing"
 
+	rbacv1 "k8s.io/api/rbac/v1"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -192,6 +194,12 @@ func TestCSVRBACPermissions(t *testing.T) {
 	// Verify cluster permissions include datavolumes and virtualmachineinstances
 	clusterPerms := csv.Spec.InstallStrategy.StrategySpec.ClusterPermissions
 	require.Len(t, clusterPerms, 1)
+	assert.Equal(t, "vm-file-restore-operator-controller-manager", clusterPerms[0].ServiceAccountName)
+	assert.Contains(t, clusterPerms[0].Rules, rbacv1.PolicyRule{
+		APIGroups: []string{"snapshot.storage.k8s.io"},
+		Resources: []string{"volumesnapshotcontents"},
+		Verbs:     []string{"get"},
+	}, "Controller service account should be able to read cluster-scoped VolumeSnapshotContents")
 
 	foundDataVolumes := false
 	foundVMInstances := false
