@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +18,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	linuxhelpers "kubevirt.io/vm-file-restore-operator/guest-helpers/linux"
 	windowshelpers "kubevirt.io/vm-file-restore-operator/guest-helpers/windows"
@@ -30,7 +33,35 @@ const (
 	cmKeyPublicKey      = "ssh-publickey"
 	cmKeyLinuxHelpers   = "linux-helpers.tar"
 	cmKeyWindowsHelpers = "windows-helpers.tar"
+
+	keypairSyncInterval = 10 * time.Second
 )
+
+// KeypairEnsurer is a manager.Runnable that periodically checks that the operator's
+// SSH keypair Secret and ConfigMap exist, recreating them if they were deleted.
+// It uses the provided client directly (non-cached) so it sees live API state.
+type KeypairEnsurer struct {
+	Client    client.Client
+	Namespace string
+}
+
+func (k *KeypairEnsurer) Start(ctx context.Context) error {
+	logger := log.FromContext(ctx).WithName("keypair-ensurer")
+	ticker := time.NewTicker(keypairSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := EnsureOperatorResources(ctx, k.Client, k.Namespace); err != nil {
+				logger.Error(err, "Failed to ensure SSH keypair resources")
+			}
+		}
+	}
+}
+
+var _ manager.Runnable = &KeypairEnsurer{}
 
 // EnsureOperatorResources creates the operator's SSH keypair and guest helper
 // tarballs if they don't exist. Private key is stored in a Secret; public key
@@ -43,8 +74,13 @@ func EnsureOperatorResources(ctx context.Context, c client.Client, namespace str
 	configMap := &corev1.ConfigMap{}
 	cmErr := c.Get(ctx, types.NamespacedName{Name: OperatorResourceName, Namespace: namespace}, configMap)
 
-	// Both exist: sync helper tarballs if the embedded scripts changed.
+	// Both exist: reconcile the public key first, then sync helper tarballs.
+	// Reconciliation is re-attempted on every poll so a transient update failure
+	// (conflict, API error) does not leave a permanently mismatched keypair.
 	if secretErr == nil && cmErr == nil {
+		if err := reconcilePublicKey(ctx, c, secret, configMap); err != nil {
+			return err
+		}
 		return ensureHelperTars(ctx, c, configMap)
 	}
 
@@ -113,7 +149,14 @@ func createKeypairAndConfigMap(ctx context.Context, c client.Client, namespace s
 		Data:       map[string][]byte{corev1.SSHAuthPrivateKey: pem.EncodeToMemory(privKeyBytes)},
 	}
 	if err := c.Create(ctx, newSecret); err != nil {
-		return fmt.Errorf("failed to create Secret: %w", err)
+		if !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create Secret: %w", err)
+		}
+		existing := &corev1.Secret{}
+		if err := c.Get(ctx, types.NamespacedName{Name: OperatorResourceName, Namespace: namespace}, existing); err != nil {
+			return fmt.Errorf("failed to get existing Secret: %w", err)
+		}
+		return createConfigMapFromSecret(ctx, c, namespace, existing)
 	}
 
 	return createConfigMap(ctx, c, namespace, string(ssh.MarshalAuthorizedKey(sshPublicKey)))
@@ -140,7 +183,47 @@ func createConfigMap(ctx context.Context, c client.Client, namespace, pubKeyStr 
 		},
 	}
 	if err := c.Create(ctx, newConfigMap); err != nil {
-		return fmt.Errorf("failed to create ConfigMap: %w", err)
+		if !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create ConfigMap: %w", err)
+		}
+		// Re-fetch both resources to get authoritative state: pubKeyStr may be stale if
+		// the Secret was rotated between the caller's initial read and this point.
+		liveSecret := &corev1.Secret{}
+		if err := c.Get(ctx, types.NamespacedName{Name: OperatorResourceName, Namespace: namespace}, liveSecret); err != nil {
+			return fmt.Errorf("failed to get Secret for ConfigMap reconciliation: %w", err)
+		}
+		existing := &corev1.ConfigMap{}
+		if err := c.Get(ctx, types.NamespacedName{Name: OperatorResourceName, Namespace: namespace}, existing); err != nil {
+			return fmt.Errorf("failed to get existing ConfigMap: %w", err)
+		}
+		if err := reconcilePublicKey(ctx, c, liveSecret, existing); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcilePublicKey checks whether the ConfigMap's public key matches the
+// private key stored in the Secret and updates the ConfigMap if they differ.
+func reconcilePublicKey(ctx context.Context, c client.Client, secret *corev1.Secret, cm *corev1.ConfigMap) error {
+	privKeyPEM := secret.Data[corev1.SSHAuthPrivateKey]
+	if len(privKeyPEM) == 0 {
+		return fmt.Errorf("Secret is missing %s", corev1.SSHAuthPrivateKey)
+	}
+	signer, err := ssh.ParsePrivateKey(privKeyPEM)
+	if err != nil {
+		return fmt.Errorf("failed to parse private key: %w", err)
+	}
+	wantPubKey := string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+	if cm.Data[cmKeyPublicKey] == wantPubKey {
+		return nil
+	}
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+	cm.Data[cmKeyPublicKey] = wantPubKey
+	if err := c.Update(ctx, cm); err != nil {
+		return fmt.Errorf("failed to reconcile ConfigMap public key: %w", err)
 	}
 	return nil
 }
@@ -177,6 +260,11 @@ func ensureHelperTars(ctx context.Context, c client.Client, cm *corev1.ConfigMap
 			}
 			if cm.BinaryData == nil {
 				cm.BinaryData = make(map[string][]byte)
+			}
+			// Re-check after refetch: the winning pod may have already applied current tars.
+			if bytes.Equal(cm.BinaryData[cmKeyLinuxHelpers], linuxTar) &&
+				bytes.Equal(cm.BinaryData[cmKeyWindowsHelpers], windowsTar) {
+				return nil
 			}
 			cm.BinaryData[cmKeyLinuxHelpers] = linuxTar
 			cm.BinaryData[cmKeyWindowsHelpers] = windowsTar

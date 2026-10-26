@@ -288,6 +288,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "FileRestoreOperator")
 		os.Exit(1)
 	}
+
+	if err := mgr.Add(&controller.KeypairEnsurer{
+		Client:    directClient,
+		Namespace: operatorNamespace,
+	}); err != nil {
+		setupLog.Error(err, "unable to add KeypairEnsurer")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {

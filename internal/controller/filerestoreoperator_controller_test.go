@@ -48,12 +48,13 @@ var _ = Describe("FileRestoreOperator Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
 		const testVersion = "0.0.1-test"
+		const testNamespace = "default"
 
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default",
+			Namespace: testNamespace,
 		}
 		filerestoreoperator := &restorev1alpha1.FileRestoreOperator{}
 
